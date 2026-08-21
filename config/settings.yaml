@@ -1,0 +1,126 @@
+# INTRADAY AI TACHYON — tunables
+#
+# WHAT BELONGS HERE: things that may safely change between sessions.
+#
+# WHAT DOES NOT: anything in CLAUDE.md §1 — the 15:15 square-off, the ₹500 daily loss limit,
+# the ₹100 per-trade risk, the 1.5×ATR stop, the 1:1.5 / 1:2.5 targets, the ATR period and
+# candle interval, the re-entry cooldown, the feed-stale threshold. Those live in
+# src/tachyon/core/constants.py as frozen Final values.
+#
+# This is enforced, not merely documented: tachyon.core.config scans this file at boot and
+# raises ProtectedConstantOverrideError if it mentions any of those names. A key that "does
+# nothing" is worse than a crash, because the operator would believe the limit had moved.
+#
+# Secrets (API keys, credentials, ports, log level) belong in .env, never here.
+
+session:
+  timezone: Asia/Kolkata
+  watchlist_only: true          # trading a symbol absent from `watchlist` is forbidden
+
+capital:
+  # The daily loss limit and the per-trade risk are DERIVED FROM THESE (tachyon.risk.budget).
+  # Leave session_budget_inr at 0 to keep the CLAUDE.md §1 constants — Rs.500 / Rs.100.
+  #
+  # Read the arithmetic before changing it; these numbers are the ones that decide how much
+  # real money a bad day costs:
+  #   daily loss limit = session_budget_inr x max_daily_drawdown_pct / 100
+  #   per-trade risk   = session_budget_inr x per_trade_risk_pct     / 100
+  #
+  # ACTIVE as of 2026-08-11, on the operator's explicit instruction (§1 requires exactly that).
+  # These values resolve to:
+  #   daily loss limit = 50000 x 2.0 / 100 = Rs.1000   <-- TWICE the §1 default of Rs.500
+  #   per-trade risk   = 50000 x 0.4 / 100 = Rs.200    <-- twice the §1 default of Rs.100
+  #   concentration    = 200 / 1000 = 0.20            <-- exactly §6.3's 20% shape; 5 losers
+  #                                                       exhaust the day, as intended
+  # Boot logs `budget.limit_raised_above_constitution` at WARNING because the day limit now
+  # exceeds Rs.500. That warning is correct and expected — it is not a fault to chase.
+  session_budget_inr: 10000.00
+  max_daily_drawdown_pct: 2.0
+  per_trade_risk_pct: 0.4
+
+watchlist:
+  # ---------------------------------------------------------------------------
+  # GENERATED 2026-08-20T09:12:08+05:30 by tachyon.strategy.scanner.
+  # Source: top 4 by |gap%| from https://www.nseindia.com/api/market-data-pre-open?key=ALL (2093 considered, budget Rs.10000)
+  #
+  # Hand edits to this block are overwritten by the next boot_tachyon.py run. The
+  # previous version of this whole file is kept at settings.yaml.bak, and the file is
+  # tracked in git.
+  #
+  # `token` and `tick_size` come from Angel One's scrip master, not from this scanner --
+  # they are read out of the same file the ingestor verifies them against at boot
+  # (CLAUDE.md 2.3), so a symbol that reached this list has already been proved to
+  # exist under the name it is written with.
+  # ---------------------------------------------------------------------------
+  - {symbol: BLEL, token: "765291", exchange: NSE, tick_size: 0.05, lot_size: 1}
+  - {symbol: SHIPROCKET, token: "765282", exchange: NSE, tick_size: 0.01, lot_size: 1}
+  - {symbol: MILKYMIST, token: "765272", exchange: NSE, tick_size: 0.01, lot_size: 1}
+  - {symbol: SIGMAADV, token: "14793", exchange: NSE, tick_size: 0.05, lot_size: 1}
+
+positions:
+  max_concurrent: 2
+  max_per_symbol: 1             # >1 would be pyramiding — rejected by validation
+
+math_engine:
+  tick_buffer_size: 2000
+  candle_buffer_size: 500
+  obi_levels: [1, 3, 5]
+  ema_periods: [9, 21, 50]
+  vwap_band_sigma: 1.5
+  warmup_on_boot: true          # cold-JIT on a live tick is a bug (CLAUDE.md §3)
+
+feed:
+  reconnect_backoff_seconds: [1, 2, 5, 10, 30]
+  max_reconnect_attempts: 20
+
+ipc:
+  hwm: 10000
+  linger_ms: 0
+  ui_conflate: true             # UI-facing SUB only; never on FILL./RISK.
+
+recorder:
+  # Track 1 LOB harvesting sidecar — scripts/run_recorder.py, its own OS process.
+  # It only ever reads the tick spine; nothing here can reach the trading path.
+  enabled: true
+  streams: [depth, tick]        # tick carries seq — the only message-loss signal on the wire
+  queue_size: 100000            # overflow drops the row and counts it; never blocks the reader
+  row_group_size: 4096
+  flush_interval_seconds: 30    # forces a partial group so a thin symbol still reaches disk
+  rotate_minutes: 60            # an open Parquet file has no footer; this bounds a hard kill
+  compression: zstd
+
+strategy:
+  obi_threshold: 0.3            # |OBI| required for a directional signal
+  ema_period: 21                # trend filter; MUST appear in math_engine.ema_periods
+  require_obi_agreement: true   # L1 and depth-weighted OBI must agree — their disagreeing
+                                # is the classic spoofing shape (CLAUDE.md §3.1)
+  evaluate_every_n_ticks: 20    # plus every candle close
+  cooldown_on_every_exit: true  # §8.1 mandates it after a stop-out; this extends it to wins
+  max_signals_per_symbol_per_session: 0   # 0 = no cap
+
+execution:
+  order_variety: ROBO
+  product_type: BO
+  trail_activation_r: 1.0       # trail arms after +1.0R in favour
+  trail_step_r: 0.5
+  move_t2_stop_to_breakeven_on_t1: true
+  max_order_retries: 3
+  rate_limit_per_second: 8      # token bucket in SmartApiClient
+
+sentinel:
+  premarket_run_ist: "08:45"
+  news_scan_interval_minutes: 15
+  request_timeout_seconds: 8
+  news_blacklist_score: 0.7
+  news_blacklist_minutes: 30
+  max_session_requests: 120     # budget breach disables the Sentinel, not trading
+  risk_off_confidence: 80       # RISK_OFF at or above this halts entries for the session;
+                                # below it the Sentinel downsizes instead
+
+ui:
+  ws_max_hz: 10
+  stale_badge_after_seconds: 2
+
+logging:
+  json_lines: true
+  directory: logs

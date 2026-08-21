@@ -1,0 +1,29 @@
+# Hermetic settings for the test suite — see tests/conftest.py.
+#
+# The suite must NOT read the operator's config/settings.yaml. Every Settings() in the suite
+# merges whichever YAML the sources point at, including instances built from explicit kwargs,
+# so an operator tuning a live value could otherwise turn a test red — or, far worse, green.
+#
+# This file is that YAML. It is a fixture, not a config: change it only to serve a test, and
+# never to mirror a change made to the real settings.yaml.
+#
+# Deliberately pinned:
+#   * the watchlist, because tests assert on RELIANCE/token 2885 by name;
+#   * `capital`, left at the shipped default of 0 so the CLAUDE.md §1 constants (Rs.500 /
+#     Rs.100) are what the suite verifies. Tests covering the DYNAMIC budget pass an explicit
+#     CapitalSettings instead — see TestBrainSessionBudget in tests/unit/test_strategy.py.
+
+session:
+  timezone: Asia/Kolkata
+  watchlist_only: true
+
+capital:
+  session_budget_inr: 0
+  max_daily_drawdown_pct: 2.0
+  per_trade_risk_pct: 1.0
+
+watchlist:
+  - {symbol: RELIANCE,  token: "2885", exchange: NSE, tick_size: 0.10, lot_size: 1}
+  - {symbol: HDFCBANK,  token: "1333", exchange: NSE, tick_size: 0.05, lot_size: 1}
+  - {symbol: ICICIBANK, token: "4963", exchange: NSE, tick_size: 0.10, lot_size: 1}
+  - {symbol: INFY,      token: "1594", exchange: NSE, tick_size: 0.10, lot_size: 1}

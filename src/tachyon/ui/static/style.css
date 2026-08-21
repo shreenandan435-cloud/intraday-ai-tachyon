@@ -1,0 +1,292 @@
+/* TACHYON terminal — CLAUDE.md §7.1, §7.2.
+ *
+ * The tokens below are copied verbatim from §7.1 and are not negotiable. No gradient wash on
+ * the canvas, no images, no CDN font. Colour carries meaning and nothing else:
+ *   lime = profit / long        magenta = loss / short
+ *   amber = degraded / stale    cyan = neutral
+ * A value that is stale renders amber with its age. It is never rendered as if it were fresh.
+ */
+
+:root {
+  --canvas:      #08091a;   /* absolute base — the only page background */
+  --panel:       rgba(18, 20, 44, 0.55);
+  --panel-brdr:  rgba(120, 160, 255, 0.14);
+  --glass-blur:  18px;
+
+  --neon-cyan:   #00f0ff;   /* primary / neutral data */
+  --neon-lime:   #39ff88;   /* profit, long, OK */
+  --neon-magenta:#ff2fb9;   /* loss, short, breach */
+  --neon-amber:  #ffb340;   /* warning, degraded, stale feed */
+  --text-dim:    #7c86b8;   /* labels, axes, secondary */
+  --text-bright: #e8ecff;
+
+  --num-size:    30px;      /* PRIMARY NUMERALS — non-negotiable */
+  --num-font:    "JetBrains Mono", "IBM Plex Mono", ui-monospace, monospace;
+  --num-glow:    0 0 12px currentColor, 0 0 28px rgba(0,240,255,0.28);
+
+  --gap: 14px;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  min-height: 100%;
+  /* §7.2: the page background is #08091a and nothing else. */
+  background: var(--canvas);
+  color: var(--text-bright);
+  font-family: var(--num-font);
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+}
+
+body { padding: var(--gap); }
+
+/* ── layout ─────────────────────────────────────────────────────────────── */
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: var(--gap);
+}
+
+.grid--wide { grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); }
+
+header.bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--gap);
+  margin-bottom: var(--gap);
+}
+
+.spacer { flex: 1 1 auto; }
+
+/* ── panels ─────────────────────────────────────────────────────────────── */
+
+.panel {
+  background: var(--panel);
+  backdrop-filter: blur(var(--glass-blur));
+  -webkit-backdrop-filter: blur(var(--glass-blur));
+  border: 1px solid var(--panel-brdr);
+  border-radius: 14px;
+  padding: 14px 16px;
+  min-width: 0;
+}
+
+/* The kill-switch gauge is always visible — never behind a tab or a scroll (§7.2). */
+.panel--critical {
+  border-color: rgba(255, 47, 185, 0.35);
+  position: sticky;
+  top: var(--gap);
+  z-index: 5;
+}
+
+.panel__label,
+.label {
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.panel__foot {
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--text-dim);
+  letter-spacing: 0.04em;
+  min-height: 14px;
+}
+
+/* ── numerals ───────────────────────────────────────────────────────────── */
+
+.num {
+  display: block;
+  margin-top: 6px;
+  font-family: var(--num-font);
+  font-size: var(--num-size);
+  font-variant-numeric: tabular-nums;   /* digits must not jitter as values change */
+  font-feature-settings: "tnum" 1, "zero" 1;
+  line-height: 1.1;
+  color: var(--neon-cyan);
+  text-shadow: var(--num-glow);
+  transition: color 220ms ease, opacity 220ms ease;
+}
+
+.num--sm { font-size: 18px; }
+.num--lg { font-size: 42px; }
+
+.num.is-long,  .num.is-profit { color: var(--neon-lime); }
+.num.is-short, .num.is-loss   { color: var(--neon-magenta); }
+.num.is-warn,  .num.is-stale  { color: var(--neon-amber); }
+.num.is-neutral               { color: var(--neon-cyan); }
+
+/* A stale value is dimmed as well as recoloured. Colour alone is not enough for an operator
+ * who is colour-blind, and this display exists to be read under stress. */
+.num.is-stale { opacity: 0.72; }
+
+/* ── gauge ──────────────────────────────────────────────────────────────── */
+
+.gauge {
+  margin-top: 10px;
+  height: 10px;
+  border-radius: 999px;
+  background: rgba(120, 160, 255, 0.10);
+  border: 1px solid var(--panel-brdr);
+  overflow: hidden;
+}
+
+.gauge__fill {
+  height: 100%;
+  width: 0%;
+  background: var(--neon-lime);
+  /* transform/opacity only where possible; width here is a single bar, not a layout thrash. */
+  transition: width 260ms ease, background-color 260ms ease;
+}
+
+.gauge__fill.is-warn   { background: var(--neon-amber); }
+.gauge__fill.is-breach { background: var(--neon-magenta); }
+
+/* ── pills ──────────────────────────────────────────────────────────────── */
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--panel-brdr);
+  background: var(--panel);
+  backdrop-filter: blur(var(--glass-blur));
+  -webkit-backdrop-filter: blur(var(--glass-blur));
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.pill strong {
+  font-weight: 500;
+  color: var(--neon-cyan);
+  text-shadow: 0 0 10px currentColor;
+}
+
+.pill.is-live strong    { color: var(--neon-magenta); }
+.pill.is-paper strong   { color: var(--neon-cyan); }
+.pill.is-ok strong      { color: var(--neon-lime); }
+.pill.is-warn strong    { color: var(--neon-amber); }
+.pill.is-breach strong  { color: var(--neon-magenta); }
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  box-shadow: 0 0 8px currentColor;
+}
+
+.dot.is-ok     { background: var(--neon-lime); }
+.dot.is-warn   { background: var(--neon-amber); }
+.dot.is-breach { background: var(--neon-magenta); }
+
+/* Nothing blinks faster than 1 Hz (§7.2). */
+@keyframes breathe {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.45; }
+}
+
+.dot.is-breach { animation: breathe 1.6s ease-in-out infinite; }
+
+/* ── tables ─────────────────────────────────────────────────────────────── */
+
+table.tape {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+
+table.tape th {
+  text-align: right;
+  font-size: 11px;
+  font-weight: 400;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--panel-brdr);
+}
+
+table.tape th:first-child,
+table.tape td:first-child { text-align: left; }
+
+table.tape td {
+  padding: 7px 8px;
+  text-align: right;
+  font-size: 15px;
+  color: var(--text-bright);
+  border-bottom: 1px solid rgba(120, 160, 255, 0.06);
+}
+
+table.tape td.sym {
+  color: var(--text-dim);
+  letter-spacing: 0.08em;
+  font-size: 12px;
+}
+
+td.is-long  { color: var(--neon-lime); }
+td.is-short { color: var(--neon-magenta); }
+td.is-stale { color: var(--neon-amber); opacity: 0.72; }
+
+/* ── event log ──────────────────────────────────────────────────────────── */
+
+.events { max-height: 240px; overflow-y: auto; }
+
+.event {
+  display: flex;
+  gap: 10px;
+  padding: 5px 0;
+  font-size: 12px;
+  border-bottom: 1px solid rgba(120, 160, 255, 0.06);
+}
+
+.event time { color: var(--text-dim); flex: 0 0 auto; font-variant-numeric: tabular-nums; }
+.event span { color: var(--text-bright); min-width: 0; word-break: break-word; }
+
+.event.is-critical span { color: var(--neon-magenta); }
+.event.is-warning span  { color: var(--neon-amber); }
+
+/* ── panic ──────────────────────────────────────────────────────────────── */
+
+.panic {
+  font-family: inherit;
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--neon-magenta);
+  background: rgba(255, 47, 185, 0.08);
+  border: 1px solid rgba(255, 47, 185, 0.4);
+  border-radius: 999px;
+  padding: 9px 18px;
+  cursor: pointer;
+  transition: opacity 160ms ease, transform 160ms ease;
+}
+
+.panic:hover  { opacity: 0.85; }
+.panic:active { transform: scale(0.97); }
+.panic[disabled] { opacity: 0.4; cursor: not-allowed; }
+
+.empty {
+  color: var(--text-dim);
+  font-size: 12px;
+  padding: 10px 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}

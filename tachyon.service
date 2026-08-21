@@ -1,0 +1,70 @@
+# TACHYON — systemd service unit
+# Place at /etc/systemd/system/tachyon.service on the server
+# Manages the boot_tachyon.py entrypoint with auto-restart
+
+[Unit]
+Description=TACHYON Intraday Trading System
+Documentation=https://github.com/your-org/intraday-ai-tachyon
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
+
+# Start after market data dependencies are ready (if any)
+# After=redis.service postgresql.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/tachyon
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/opt/tachyon/src
+EnvironmentFile=-/opt/tachyon/.env
+
+# Virtual environment python
+ExecStart=/opt/tachyon/venv/bin/python /opt/tachyon/boot_tachyon.py
+
+# Restart policy — always restart on failure, with backoff
+Restart=always
+RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Resource limits — prevent runaway memory/CPU
+MemoryMax=4G
+CPUQuota=200%
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/tachyon/data /opt/tachyon/logs
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@clock @debug @module @mount @obsolete @privileged @raw-io @reboot @swap
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tachyon
+
+# Timeout — allow graceful shutdown (square-off takes ~30s)
+TimeoutStartSec=60
+TimeoutStopSec=60
+KillSignal=SIGTERM
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

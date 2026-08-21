@@ -1,0 +1,13 @@
+# INTRADAY AI TACHYON — development / test dependencies
+# Install:  python -m pip install -r requirements.txt -r requirements-dev.txt
+
+-r requirements.txt
+
+pytest==9.1.1
+pytest-asyncio==1.4.0
+pytest-cov==7.1.0             # risk/ and execution/ geometry require 100% branch coverage
+freezegun==1.5.5              # deterministic clock tests for square-off + loss-limit latch
+ruff==0.16.2                  # lint + format, line length 100
+mypy==2.3.0                   # --strict over src/tachyon/
+types-pyyaml==6.0.12.20260724
+rich==15.0.0                  # CLI diagnostics only — never a runtime dependency of the Brain

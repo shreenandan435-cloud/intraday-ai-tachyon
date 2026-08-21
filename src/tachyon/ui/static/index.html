@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en" data-theme="tachyon">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark" />
+  <title>TACHYON</title>
+  <!-- No CDN, no external font, no framework. The terminal must load fully offline
+       (CLAUDE.md §7). Everything it needs is served from /static. -->
+  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="icon" href="data:," />
+</head>
+<body>
+
+<header class="bar">
+  <span class="pill" id="pill-mode"><span class="dot" id="dot-mode"></span>MODE&nbsp;<strong id="mode">—</strong></span>
+  <span class="pill" id="pill-state"><span class="dot" id="dot-state"></span>STATE&nbsp;<strong id="state">—</strong></span>
+  <span class="pill" id="pill-feed"><span class="dot" id="dot-feed"></span>FEED&nbsp;<strong id="feed">—</strong></span>
+  <span class="pill" id="pill-macro"><span class="dot" id="dot-macro"></span>SENTINEL&nbsp;<strong id="macro">—</strong></span>
+  <span class="pill" id="pill-link"><span class="dot" id="dot-link"></span>LINK&nbsp;<strong id="link">CONNECTING</strong></span>
+  <span class="spacer"></span>
+  <!-- The only control on the page. It blocks new entries; it does not flatten.
+       Labelled for what it does, because §7.2 puts truthfulness above aesthetics. -->
+  <button class="panic" id="panic" type="button" title="Engages the daily lock. Blocks all new entries for the session and across restarts. Does NOT flatten open positions.">
+    ⛔ PANIC · BLOCK NEW ENTRIES
+  </button>
+</header>
+
+<!-- §7.2: the kill-switch / P&L-vs-limit gauge is always visible, never behind a tab. -->
+<section class="panel panel--critical" id="pnl-panel">
+  <div class="grid grid--wide">
+    <div>
+      <div class="label">Session P&amp;L · realised + floating − charges</div>
+      <span class="num num--lg" id="pnl-total" data-track="pnl">—</span>
+      <div class="gauge"><div class="gauge__fill" id="pnl-gauge"></div></div>
+      <div class="panel__foot" id="pnl-foot">awaiting telemetry</div>
+    </div>
+    <div>
+      <div class="label">Headroom to limit</div>
+      <span class="num" id="pnl-headroom" data-track="pnl">—</span>
+      <div class="panel__foot" id="limit-foot">limit —</div>
+    </div>
+    <div>
+      <div class="label">Realised</div>
+      <span class="num" id="pnl-realised" data-track="pnl">—</span>
+      <div class="panel__foot" id="trades-foot">— trades</div>
+    </div>
+    <div>
+      <div class="label">Floating</div>
+      <span class="num" id="pnl-floating" data-track="pnl">—</span>
+      <div class="panel__foot" id="charges-foot">charges —</div>
+    </div>
+  </div>
+</section>
+
+<div style="height:14px"></div>
+
+<section class="grid grid--wide">
+  <div class="panel">
+    <div class="label">Tape · last traded price</div>
+    <table class="tape">
+      <thead>
+        <tr><th>Symbol</th><th>LTP</th><th>Bid</th><th>Ask</th><th>Spread</th><th>Age</th></tr>
+      </thead>
+      <tbody id="tape"><tr><td colspan="6" class="empty">no market data yet</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="panel">
+    <div class="label">Order book imbalance · touch / ladder</div>
+    <table class="tape">
+      <thead>
+        <tr><th>Symbol</th><th>OBI (L1)</th><th>OBI (weighted)</th><th>Age</th></tr>
+      </thead>
+      <tbody id="obi"><tr><td colspan="4" class="empty">no depth yet</td></tr></tbody>
+    </table>
+  </div>
+</section>
+
+<div style="height:14px"></div>
+
+<section class="grid grid--wide">
+  <div class="panel">
+    <div class="label">Exposure</div>
+    <span class="num num--sm" id="open-symbols" data-track="session">FLAT</span>
+    <div class="panel__foot" id="cooling-foot">no symbols cooling</div>
+  </div>
+
+  <div class="panel">
+    <div class="label">Sentinel · macro regime</div>
+    <span class="num num--sm" id="macro-regime" data-track="session">—</span>
+    <div class="panel__foot" id="macro-foot">awaiting classification</div>
+  </div>
+
+  <div class="panel" style="grid-column: 1 / -1">
+    <div class="label">Fills &amp; risk events</div>
+    <div class="events" id="events"><div class="empty">nothing yet</div></div>
+  </div>
+</section>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

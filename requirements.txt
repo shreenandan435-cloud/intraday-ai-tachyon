@@ -1,0 +1,73 @@
+# INTRADAY AI TACHYON — runtime dependencies
+# Python 3.14 (verified: every compiled dep below ships a cp314 wheel)
+# Install:  python -m pip install -r requirements.txt
+
+# ── Broker / Market Data ───────────────────────────────────────────────
+smartapi-python==1.5.5        # Angel One SmartAPI REST + Robo/Bracket orders
+websockets==17.0.1            # async SmartAPI WebSocket v2 binary tick + L2 depth feed
+websocket-client==1.9.0       # transitive dep of smartapi-python (sync client; unused by us)
+pyotp==2.10.0                 # TOTP for SmartAPI login
+logzero==1.7.0                # hard transitive dep of smartapi-python
+
+# ── IPC Backbone (CLAUDE.md §2) ────────────────────────────────────────
+pyzmq==27.1.0                 # ZeroMQ PUB/SUB + PUSH/PULL between Ingestor and Brain
+msgspec==0.21.1               # zero-copy Struct wire schemas (pickle is banned over IPC)
+
+# ── Math Engine (CLAUDE.md §3) ─────────────────────────────────────────
+numba==0.66.0                 # JIT kernels: VWAP, EMA, ATR(Wilder), OBI
+numpy==2.4.6                  # ring buffers, float64 arrays — the only tick-path container
+                              # pinned <2.5: numba 0.66 does not support numpy 2.5 yet
+pandas==3.0.5                 # offline analysis / backtest reporting ONLY — never in the tick path
+
+# ── Data Harvesting (Track 1: LOB recorder sidecar) ────────────────────
+pyarrow==25.0.1               # Parquet writer for scripts/run_recorder.py.
+                              # Imported ONLY by persistence/tick_recorder.py, which is
+                              # imported only by the sidecar process — it never loads into
+                              # the Ingestor or the Brain.
+
+# ── Deep RL (Track 2: offline Transformer-PPO training) ────────────────
+# OFFLINE ONLY. Imported exclusively by src/tachyon/model/*, which nothing in the trading path
+# loads — see that package's docstring. `import torch` alone costs seconds and hundreds of MB of
+# RSS, and a CUDA context inside the orchestrator would put a driver-level allocator behind the
+# <1ms inference budget.
+torch==2.13.0                 # cp314 wheel verified. THIS PIN IS THE CPU BUILD.
+                              # PyPI ships CPU-only wheels for Windows. The RTX 5060 in this
+                              # machine is Blackwell (sm_120) and needs a CUDA 12.8+ build, which
+                              # only the PyTorch index serves:
+                              #   pip install torch==2.13.0 --index-url \
+                              #       https://download.pytorch.org/whl/cu128
+                              # Everything here runs correctly on the CPU build — it is just slow
+                              # to train on. Swap it before the first real training run.
+onnx==1.22.0                  # export target; the artefact TensorRT consumes
+onnxscript==0.7.1             # required by torch.onnx.export(dynamo=True)
+onnxruntime==1.28.0           # exercised in tests/unit/test_model.py to prove the exported
+                              # graph still computes what the PyTorch module computes
+
+# ── AI Sentinel (CLAUDE.md §5) ─────────────────────────────────────────
+# No google-genai: the Sentinel speaks the Generative Language REST API directly over httpx.
+# The SDK brings its own transport and retry behaviour we would have to work around, and the
+# only call we make is a single-turn generateContent. One client we fully understand beats a
+# large one we mostly do.
+httpx==0.28.1                 # the only permitted HTTP client (async; `requests` is banned)
+                              # — also the SmartAPI REST transport (CLAUDE.md §6.4)
+
+# ── UI (CLAUDE.md §7) ──────────────────────────────────────────────────
+fastapi==0.141.1              # read-only telemetry API + WebSocket push
+uvicorn[standard]==0.52.1     # ASGI server
+# No jinja2: the terminal is a static page served from ui/static. There is nothing to
+# template — the browser fills every value from the WebSocket, and a server-rendered
+# first paint would be a snapshot that is already stale when it arrives (CLAUDE.md §7.2).
+orjson==3.11.9                # fast JSON for the UI WebSocket frames
+
+# ── Core / Infra (CLAUDE.md §8) ────────────────────────────────────────
+pydantic==2.13.4              # validated, frozen settings models
+pydantic-settings==2.15.0     # layered .env + settings.yaml loading (core/config.py)
+python-dotenv==1.2.2          # .env secrets loading (never committed)
+pyyaml==6.0.3                 # config/settings.yaml tunables
+structlog==26.1.0             # JSON-line structured logging
+apscheduler==3.11.3           # pre-market Sentinel job + session schedule
+tzdata==2026.3                # Asia/Kolkata zoneinfo on Windows (required, not optional)
+
+# ── Event loop accelerator (platform-split; see CLAUDE.md §2.2) ────────
+winloop==0.6.3; sys_platform == "win32"
+uvloop==0.22.1; sys_platform != "win32"

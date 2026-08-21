@@ -1,0 +1,93 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "intraday-ai-tachyon"
+version = "0.1.0"
+description = "Single-operator NSE intraday trading system — ZeroMQ IPC, Numba math engine, hard risk gate"
+requires-python = ">=3.14"
+dynamic = ["dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# ── Lint / format (CLAUDE.md §8) ───────────────────────────────────────
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+src = ["src", "tests"]
+# Markdown is documentation, not source. `ruff format` reflows fenced python blocks, and the
+# one in CLAUDE.md §1 is column-aligned on purpose so the hard constants read as a table. A
+# formatter that silently rewrites the constitution is worse than an unformatted code fence.
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "SIM", "RET", "ARG", "PTH", "ASYNC", "T20"]
+# T20 bans print(); all output goes through structlog.
+# ASYNC catches blocking calls in async paths (CLAUDE.md §2.2).
+
+[tool.ruff.lint.per-file-ignores]
+# SIM300 misfires on `assert constants.X == time(15, 15)`, proposing the genuinely
+# Yoda form `time(15, 15) == constants.X`. Assertions read subject-first.
+# ASYNC110 wants an asyncio.Event instead of polling in a `while` loop. Correct for production
+# code, and enforced there — but an integration test waiting on a counter inside the component
+# under test has nothing to wait on, and adding an Event purely for the test would be adding
+# test scaffolding to the trading path.
+"tests/*" = ["ARG", "SIM300", "ASYNC110"]
+"scripts/*" = ["T20"]          # entrypoints may print boot banners before logging is up
+# main.py is an entrypoint too. The LIVE confirmation banner must reach the operator's
+# terminal before they type; a structlog line to a file is not a prompt.
+"src/tachyon/main.py" = ["T20"]
+
+# ── Types ──────────────────────────────────────────────────────────────
+[tool.mypy]
+python_version = "3.14"
+files = ["src/tachyon"]
+strict = true
+warn_unreachable = true
+plugins = ["pydantic.mypy"]
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+[[tool.mypy.overrides]]
+# winloop/uvloop are platform-split (requirements.txt), so exactly one of them is absent on
+# any given machine while both import paths must still type-check.
+#
+# pyarrow ships no py.typed marker. It is confined to persistence.tick_recorder (the Track 1
+# sidecar) and never imported by the Ingestor or the Brain, so the untyped surface stays off
+# the trading path entirely.
+module = ["SmartApi.*", "logzero.*", "numba.*", "winloop.*", "uvloop.*", "pyarrow.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# @njit is an untyped decorator, so strict mode would reject every kernel. The signatures are
+# still declared and checked at the call sites; only the decorator itself is exempted.
+module = ["tachyon.math_engine.indicators"]
+disallow_untyped_decorators = false
+
+# ── Tests ──────────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+addopts = "-q --strict-markers"
+markers = [
+    "perf: latency benchmarks for the Numba kernels (CLAUDE.md §3, <50us target)",
+    "live: requires real broker credentials — never run in CI",
+]
+
+[tool.coverage.report]
+# CLAUDE.md §8: risk/ and order geometry require 100% branch coverage.
+#
+# NOTE: math_engine/indicators.py always reports low coverage. Numba-compiled functions run as
+# machine code and never hit CPython's line tracer, so coverage cannot see inside a kernel body
+# even while tests exercise it thoroughly. Judge those kernels by tests/unit/test_math_engine.py
+# (each is checked against an independent reference implementation), not by this number.
+exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError"]
