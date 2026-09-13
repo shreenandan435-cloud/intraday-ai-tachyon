@@ -96,3 +96,5 @@ scripts/
 
 # Test/log output
 *.out
+test_out.log
+test_output.log
