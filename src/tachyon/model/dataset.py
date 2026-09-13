@@ -463,9 +463,16 @@ def _load_block(
 def _stack(
     columns: dict[str, npt.NDArray[np.generic]], prefix: str, order: npt.NDArray[np.intp]
 ) -> npt.NDArray[np.float64]:
-    """Gather the five levels of one side into an ``(N, DEPTH_LEVELS)`` array, row-sorted."""
+    """Gather the five levels of one side into an ``(N, DEPTH_LEVELS)`` array, row-sorted.
+
+    ``astype(copy=False)``: the fancy-index ``[order]`` already produced a fresh array —
+    a second unconditional astype copy would double this function's memory traffic.
+    """
     return np.stack(
-        [columns[f"{prefix}_{level}"][order].astype(np.float64) for level in range(DEPTH_LEVELS)],
+        [
+            columns[f"{prefix}_{level}"][order].astype(np.float64, copy=False)
+            for level in range(DEPTH_LEVELS)
+        ],
         axis=1,
     )
 

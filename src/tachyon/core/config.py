@@ -14,7 +14,10 @@ raised, and the system trades all day against a limit that never moved. So every
 scanned for protected names *before* validation and a match is a hard boot failure —
 see :class:`ProtectedConstantOverrideError`.
 
-Precedence (highest first): init kwargs → environment → ``.env`` → ``settings.yaml`` → defaults.
+Precedence (highest first): init kwargs → environment → .env → settings.yaml → defaults.
+
+Credential env-var precedence (highest first): SMARTAPI_* (new convention), then legacy
+aliases (SMARTAPI_CLIENT_ID / SMARTAPI_PIN, ANGEL_*), then empty.
 """
 
 from __future__ import annotations
@@ -24,7 +27,8 @@ from collections.abc import Iterable, Mapping
 from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Final, Literal
+from types import MappingProxyType
+from typing import Any, Final, Literal, cast
 
 import yaml
 from dotenv import dotenv_values
@@ -105,6 +109,62 @@ def _reject_protected(payload: object, origin: str) -> None:
             f"configured. Remove the key; if the value genuinely must change, edit "
             f"constants.py and update its test."
         )
+
+
+# SmartAPI credential resolution -- SMARTAPI_* (primary) then ANGEL_* (legacy alias).
+#
+# Precedence, highest first:
+#   1. SMARTAPI_*  -- the new convention written into .env.
+#   2. Legacy aliases (SMARTAPI_CLIENT_ID / SMARTAPI_PIN, ANGEL_*)  -- accepted as a
+#      fallback so an operator with an existing .env is not silently broken.
+#   3. Empty default  -- the field still constructs, but validate_live_ready() refuses
+#      to let the process trade.
+#
+# Both conventions resolve into the same four smartapi_* pydantic fields; the only
+# observable difference is which env name wins. _apply_legacy_aliases runs in
+# mode="before" so pydantic-settings sees the merged value as if it had always been
+# written that way.
+
+_LEGACY_ENV_FALLBACKS: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
+    {
+        "smartapi_api_key": ("SMARTAPI_API_KEY", "ANGEL_API_KEY"),
+        "smartapi_client_code": (
+            "SMARTAPI_CLIENT_CODE",
+            "SMARTAPI_CLIENT_ID",
+            "ANGEL_CLIENT_ID",
+        ),
+        "smartapi_password": ("SMARTAPI_PASSWORD", "SMARTAPI_PIN", "ANGEL_PIN"),
+        "smartapi_totp_secret": ("SMARTAPI_TOTP_SECRET", "ANGEL_TOTP_SECRET"),
+    }
+)
+
+
+def _resolve_legacy_aliases() -> dict[str, str]:
+    """Resolve the four SmartAPI credentials from os.environ, honouring legacy aliases.
+
+    Per-field lookup order is the order declared in _LEGACY_ENV_FALLBACKS: SMARTAPI_*
+    first, then legacy aliases (SMARTAPI_CLIENT_ID / SMARTAPI_PIN and ANGEL_*).
+    Returns {field_name: first_non_empty_env_value}.
+    """
+    resolved: dict[str, str] = {}
+    for field_name, env_names in _LEGACY_ENV_FALLBACKS.items():
+        for env_name in env_names:
+            value = os.environ.get(env_name)
+            if value:
+                resolved[field_name] = value
+                break
+    return resolved
+
+
+def _is_blank(value: object) -> bool:
+    """True if value is missing, None, or an empty SecretStr / empty string."""
+    if value is None:
+        return True
+    if isinstance(value, SecretStr):
+        return not value.get_secret_value()
+    if isinstance(value, str):
+        return not value
+    return False
 
 
 def _guard_all_sources() -> None:
@@ -224,6 +284,14 @@ class MathEngineSettings(_Section):
 
 
 class FeedSettings(_Section):
+    """Live feed transport tuning.
+
+    ``stream_url`` overrides the SmartStream WebSocket endpoint. Empty (the default) keeps
+    the client's canonical SmartStream v2 URL ``wss://smartapisocket.angelone.in/smart-stream``;
+    a non-empty value must use the ``ws://`` or ``wss://`` scheme.
+    """
+
+    stream_url: str = ""
     reconnect_backoff_seconds: tuple[float, ...] = (1.0, 2.0, 5.0, 10.0, 30.0)
     max_reconnect_attempts: int = Field(default=20, ge=1)
 
@@ -303,6 +371,12 @@ class StrategySettings(_Section):
     max_signals_per_symbol_per_session: int = Field(default=0, ge=0)
     """Hard cap on entries per symbol per day. ``0`` disables the cap."""
 
+    max_vwap_extension_pct: float = Field(default=1.5, gt=0)
+    """Overextension guardrail (CLAUDE.md §4, entry check 12): a LONG is vetoed when the
+    LTP sits more than this percentage **above** session VWAP — the signature of buying
+    the top of a vertical breakout, where mean reversion against the position is immediate.
+    Exits are never gated by this; it protects entries only."""
+
 
 class ExecutionSettings(_Section):
     order_variety: Literal["ROBO"] = "ROBO"
@@ -333,6 +407,26 @@ class UiSettings(_Section):
     stale_badge_after_seconds: float = Field(default=2.0, gt=0)
 
 
+class RLSettings(_Section):
+    """PPO training hyperparameters.
+
+    These control the offline training loop in tachyon.rl.train.PPOTrainer.
+    They do NOT affect the live trading path.
+    """
+
+    lr: float = Field(default=3e-4, gt=0)
+    gamma: float = Field(default=0.99, gt=0, le=1)
+    gae_lambda: float = Field(default=0.95, gt=0, le=1)
+    clip_ratio: float = Field(default=0.2, gt=0, le=1)
+    value_clip: float = Field(default=0.2, gt=0, le=1)
+    entropy_coef: float = Field(default=0.01, ge=0)
+    max_grad_norm: float = Field(default=0.5, gt=0)
+    batch_size: int = Field(default=64, ge=1)
+    minibatch_size: int = Field(default=32, ge=1)
+    epochs: int = Field(default=4, ge=1)
+    device: Literal["cpu", "cuda"] = "cpu"
+
+
 class LoggingSettings(_Section):
     json_lines: bool = True
     directory: str = "logs"
@@ -357,6 +451,10 @@ class Settings(BaseSettings):
 
     # ── from .env ────────────────────────────────────────────────────────────
     trading_mode: TradingMode = DEFAULT_TRADING_MODE
+    # Override for the 15:15 IST square-off deadline, populated by the --mock CLI flag
+    # only (offline rehearsals). Accepts "HH:MM" (24-hour); absent or blank keeps the
+    # unconditional 15:15 deadline — there is no other way to move it.
+    mock_squareoff_time: str | None = None
 
     smartapi_api_key: SecretStr = SecretStr("")
     smartapi_client_code: SecretStr = SecretStr("")
@@ -380,9 +478,32 @@ class Settings(BaseSettings):
     telegram_chat_id: str = ""
     telegram_alerts_enabled: bool = True
 
+    # ── ZMQ port map — single source of truth ───────────────────────────────────
+    # Every endpoint has EXACTLY ONE binder; everyone else connects:
+    #   5555  tick spine     PUB  binds: ingestor (ingestion/service.py)
+    #                        SUB  connects: brain, UI, recorder
+    #   5556  state spine    PUB  binds: brain (strategy/telemetry.py)
+    #                        SUB  connects: UI
+    #   5557  sentinel       reserved — nothing binds it yet
+    #   5566  sidecar control REP binds: tachyon_sidecar (EngineSidecar.cpp)
+    #                        REQ  connects: rl.export.signal_hot_swap
+    #   5567  action spine   PUSH binds: tachyon_sidecar
+    #                        PULL connects: execution/router.py
+    # A second bind() on any of these is a startup fault (EADDRINUSE), never a
+    # silent share — the sidecar once defaulted its control server to 5555 and
+    # contested the tick spine; keep new services on connect() instead.
     zmq_tick_endpoint: str = "tcp://127.0.0.1:5555"
     zmq_state_endpoint: str = "tcp://127.0.0.1:5556"
     zmq_sentinel_endpoint: str = "tcp://127.0.0.1:5557"
+
+    #: Sidecar control (REQ/REP). The C++ sidecar binds the REP server; hot-swap
+    #: signals connect to it as REQ. ``main.py`` passes this to the sidecar as
+    #: ``--endpoint`` and ``rl.export.DEFAULT_CONTROL_ENDPOINT`` mirrors it.
+    zmq_sidecar_control_endpoint: str = "tcp://127.0.0.1:5566"
+
+    #: The action spine (Track 2 → Track 1): the C++ sidecar PUSHes discrete
+    #: actions here; the ExecutionRouter PULLs them into the risk gate.
+    zmq_action_endpoint: str = "tcp://127.0.0.1:5567"
 
     ui_host: str = "127.0.0.1"
     ui_port: int = Field(default=8787, ge=1024, le=65535)
@@ -402,6 +523,7 @@ class Settings(BaseSettings):
     execution: ExecutionSettings = ExecutionSettings()
     sentinel: SentinelSettings = SentinelSettings()
     ui: UiSettings = UiSettings()
+    rl: RLSettings = RLSettings()
     logging: LoggingSettings = LoggingSettings()
 
     @classmethod
@@ -429,6 +551,26 @@ class Settings(BaseSettings):
             ),
             YamlConfigSettingsSource(settings_cls, yaml_file=SETTINGS_YAML),
         )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _apply_legacy_aliases(cls, data: object) -> Mapping[str, Any]:
+        """Apply legacy ANGEL_* / SMARTAPI_CLIENT_ID / SMARTAPI_PIN aliases.
+
+        Runs before _guard_constants so guards still see the merged view. For each of
+        the four SmartAPI credential fields, fills in a value from
+        _resolve_legacy_aliases() only if the incoming data is blank or missing. The
+        SMARTAPI_* env names win over the legacy aliases by virtue of
+        _LEGACY_ENV_FALLBACKS ordering. Non-mapping data (e.g. an init positional
+        value) is returned unchanged so pydantic's own coercion still runs.
+        """
+        if not isinstance(data, Mapping):
+            return cast(Mapping[str, Any], data)
+        merged: dict[str, Any] = dict(data)
+        for field_name, value in _resolve_legacy_aliases().items():
+            if _is_blank(merged.get(field_name)):
+                merged[field_name] = SecretStr(value)
+        return merged
 
     @model_validator(mode="before")
     @classmethod
@@ -499,14 +641,38 @@ class Settings(BaseSettings):
         return next((item for item in self.watchlist if item.symbol == symbol), None)
 
     def missing_live_credentials(self) -> tuple[str, ...]:
-        """Names of credentials required for LIVE trading that are absent or blank."""
-        required = {
-            "SMARTAPI_API_KEY": self.smartapi_api_key,
-            "SMARTAPI_CLIENT_CODE": self.smartapi_client_code,
-            "SMARTAPI_PASSWORD": self.smartapi_password,
-            "SMARTAPI_TOTP_SECRET": self.smartapi_totp_secret,
+        """Names of credentials required for LIVE trading that are absent or blank.
+
+        Resolves each credential alias-aware: the resolved smartapi_* field on self
+        (already populated by _apply_legacy_aliases) is consulted first; if it is
+        still empty, the legacy ANGEL_* env names are consulted directly. Either
+        source is enough for the credential to be considered set, so this remains
+        backward compatible with operators still using the ANGEL_* convention.
+        """
+        resolved: dict[str, str] = {
+            "smartapi_api_key": self.smartapi_api_key.get_secret_value(),
+            "smartapi_client_code": self.smartapi_client_code.get_secret_value(),
+            "smartapi_password": self.smartapi_password.get_secret_value(),
+            "smartapi_totp_secret": self.smartapi_totp_secret.get_secret_value(),
         }
-        return tuple(name for name, secret in required.items() if not secret.get_secret_value())
+        for field_name, env_names in _LEGACY_ENV_FALLBACKS.items():
+            if resolved[field_name]:
+                continue
+            for env_name in env_names:
+                legacy = os.environ.get(env_name)
+                if legacy:
+                    resolved[field_name] = legacy
+                    break
+        return tuple(
+            label
+            for label, field_name in (
+                ("SMARTAPI_API_KEY", "smartapi_api_key"),
+                ("SMARTAPI_CLIENT_CODE", "smartapi_client_code"),
+                ("SMARTAPI_PASSWORD", "smartapi_password"),
+                ("SMARTAPI_TOTP_SECRET", "smartapi_totp_secret"),
+            )
+            if not resolved[field_name]
+        )
 
     def validate_live_ready(self) -> None:
         """Raise unless the process is genuinely equipped to trade live.

@@ -110,7 +110,7 @@ def _decimal(value: object, default: Decimal = ZERO) -> Decimal:
         return default
     try:
         parsed = Decimal(str(value))
-    except InvalidOperation, ValueError, TypeError:
+    except (InvalidOperation, ValueError, TypeError):
         return default
     return parsed if parsed.is_finite() else default
 
@@ -118,7 +118,7 @@ def _decimal(value: object, default: Decimal = ZERO) -> Decimal:
 def _int(value: object, default: int = 0) -> int:
     try:
         return int(Decimal(str(value or 0)))
-    except InvalidOperation, ValueError, TypeError:
+    except (InvalidOperation, ValueError, TypeError):
         return default
 
 

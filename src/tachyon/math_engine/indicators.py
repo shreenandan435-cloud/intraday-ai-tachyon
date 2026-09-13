@@ -22,15 +22,62 @@ ever appears — and this module uses NaN as a load-bearing "indicator undefined
 Under those flags, a NaN comparison becomes undefined behaviour, so a not-ready indicator
 could silently start producing signals. Measured, the flag buys a few microseconds against a
 50 µs budget we already meet by an order of magnitude. Correctness wins.
+
+Cache locator safety (``cannot cache function: no locator available``)
+---------------------------------------------------------------------
+``cache=True`` asks Numba to persist compiled artefacts beside this source file. That fails
+with the error above when the source tree is read-only, frozen into a zipapp/PyInstaller
+bundle, or otherwise has "no locator". The failure surfaces at first *call* — i.e. during
+warmup or, worst case, on a live tick.
+
+Before any kernel is decorated, :func:`_ensure_numba_cache_dir` points Numba at a writable
+cache directory: an explicit ``NUMBA_CACHE_DIR`` wins; otherwise a ``.numba_cache/`` folder
+next to the source tree root, then the working directory. If nothing is writable the
+environment stays unset and warmup reports the failure honestly instead of crashing a live
+tick.
 """
 
 from __future__ import annotations
+
+import contextlib
+import os
+from pathlib import Path
 
 import numpy as np
 import numpy.typing as npt
 from numba import njit
 
 _F64 = npt.NDArray[np.float64]
+
+
+def _ensure_numba_cache_dir() -> None:
+    """Give Numba a writable cache location before any ``@njit(cache=True)`` runs.
+
+    Numba reads ``NUMBA_CACHE_DIR`` when a dispatcher's cache locator is built — at
+    decoration time in this module. An explicit environment setting always wins; without
+    one we try the repository root first (keeps artefacts with the code), then the working
+    directory. Every filesystem touch is best-effort: if none are writable we leave the
+    environment alone and let warmup surface the real error.
+    """
+    if os.environ.get("NUMBA_CACHE_DIR"):
+        return
+
+    candidates: list[Path] = []
+    # indicators.py -> math_engine -> tachyon -> src -> <repo root>
+    with contextlib.suppress(IndexError):
+        candidates.append(Path(__file__).resolve().parents[3] / ".numba_cache")
+    candidates.append(Path.cwd() / ".numba_cache")
+
+    for candidate in candidates:
+        with contextlib.suppress(OSError):
+            candidate.mkdir(parents=True, exist_ok=True)
+            os.environ["NUMBA_CACHE_DIR"] = str(candidate)
+            return
+
+
+# Runs before every @njit decoration: Numba snapshots NUMBA_CACHE_DIR when each
+# dispatcher's cache locator is built.
+_ensure_numba_cache_dir()
 
 
 @njit(cache=True, nogil=True)
@@ -91,6 +138,52 @@ def calculate_ema(prices: _F64, period: int) -> float:
     for i in range(period, n):
         ema = alpha * prices[i] + (1.0 - alpha) * ema
     return ema
+
+
+@njit(cache=True, nogil=True)
+def calculate_emas(prices: _F64, periods: npt.NDArray[np.int64], out: _F64) -> None:
+    """Every EMA period in one pass over ``prices`` — the multi-period fusion of
+    :func:`calculate_ema`.
+
+    ``snapshot`` used to walk the 2000-sample tick buffer once per period: three passes
+    and three JIT dispatches for the default ``(9, 21, 50)``. The per-period recurrences
+    are independent running states, so they fuse into a single pass with one dispatch.
+    The per-period operation order is unchanged — seeding sums ``prices[:period]`` oldest
+    first, then the same Wilder-style recursion — so results are bit-identical to calling
+    :func:`calculate_ema` per period.
+
+    Args:
+        prices: trade prices, oldest first.
+        periods: EMA lookbacks, int64.
+        out: pre-allocated float64 array, same length as ``periods``; receives the final
+            EMA per period, or ``NaN`` when fewer than ``period`` samples are available
+            (same sentinel contract as :func:`calculate_ema`).
+    """
+    n = prices.shape[0]
+    p_count = periods.shape[0]
+
+    seeds = np.zeros(p_count)
+    emas = np.zeros(p_count)
+    alphas = np.zeros(p_count)
+    for p in range(p_count):
+        alphas[p] = 2.0 / (periods[p] + 1.0)
+
+    for i in range(n):
+        price = prices[i]
+        for p in range(p_count):
+            period = periods[p]
+            if i < period:
+                seeds[p] += price
+                if i == period - 1:
+                    emas[p] = seeds[p] / period
+            else:
+                emas[p] = alphas[p] * price + (1.0 - alphas[p]) * emas[p]
+
+    for p in range(p_count):
+        if periods[p] < 1 or n < periods[p]:
+            out[p] = np.nan
+        else:
+            out[p] = emas[p]
 
 
 @njit(cache=True, nogil=True)
@@ -227,6 +320,7 @@ def calculate_depth_weighted_obi(
 KERNELS = (
     calculate_vwap,
     calculate_ema,
+    calculate_emas,
     calculate_wilder_atr,
     calculate_obi,
     calculate_depth_weighted_obi,

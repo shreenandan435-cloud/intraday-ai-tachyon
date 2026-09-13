@@ -38,7 +38,7 @@ creating brand-new naked risk at the moment the system is trying to have none.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Final
@@ -47,6 +47,7 @@ from tachyon.core.clock import SYSTEM_CLOCK, Clock, now_ist
 from tachyon.core.config import Settings, get_settings
 from tachyon.core.constants import TradingMode
 from tachyon.core.logger import get_logger
+from tachyon.core.symbols import normalize_symbol
 from tachyon.execution.api import (
     BrokerOrder,
     BrokerPosition,
@@ -64,14 +65,16 @@ from tachyon.execution.builder import (
     OrderRejected,
     Side,
     round_to_tick,
+    trading_symbol_for,
 )
 from tachyon.execution.journal import OrderJournal
-from tachyon.risk.engine import RiskDecision, RiskEngine
-from tachyon.risk.tracker import PositionRegistry
+from tachyon.risk.engine import ExitDecision, RiskDecision, RiskEngine
+from tachyon.risk.tracker import PnLTracker, PositionRegistry, to_decimal
 
 _log = get_logger(__name__)
 
 ZERO: Final[Decimal] = Decimal("0")
+ONE: Final[Decimal] = Decimal("1")
 
 VARIETY_ROBO: Final[str] = "ROBO"
 VARIETY_NORMAL: Final[str] = "NORMAL"
@@ -215,6 +218,43 @@ class FlattenReport:
         return self.residual_orders == 0 and self.residual_positions == 0
 
 
+#: Outcome classes for :attr:`ExitExecutionReport.status`.
+EXIT_SUBMITTED: Final[str] = "SUBMITTED"
+EXIT_SUPPRESSED: Final[str] = "SUPPRESSED"
+EXIT_REJECTED: Final[str] = "REJECTED"
+
+
+@dataclass(frozen=True, slots=True)
+class ExitExecutionReport:
+    """Outcome of one per-tick protective exit (:meth:`RoboExecutor.execute_exit`).
+
+    ``status`` drives the caller's retry marker:
+
+    * ``SUBMITTED`` — accepted (or simulated in PAPER). A market exit may now be live;
+      resending would reverse the position. Hold until the registry frees the symbol.
+    * ``SUPPRESSED`` — a duplicate or otherwise unsafe resend was blocked. Hold likewise.
+    * ``REJECTED`` — definitively not sent. Safe to retry on a later tick.
+    """
+
+    symbol: str
+    reason: str
+    status: str
+    simulated: bool = False
+    order_id: str = ""
+    order_tag: str = ""
+    quantity: int = 0
+    detail: str = ""
+
+    @property
+    def accepted(self) -> bool:
+        return self.status == EXIT_SUBMITTED
+
+    @property
+    def retriable(self) -> bool:
+        """True when a later tick should be allowed to try again."""
+        return self.status == EXIT_REJECTED
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Executor
 # ──────────────────────────────────────────────────────────────────────────────
@@ -247,6 +287,7 @@ class RoboExecutor:
         "_exit_attempted",
         "_journal",
         "_mode",
+        "_pnl",
         "_positions",
         "_risk",
         "_settings",
@@ -263,6 +304,7 @@ class RoboExecutor:
         settings: Settings | None = None,
         mode: TradingMode | None = None,
         clock: Clock = SYSTEM_CLOCK,
+        pnl: PnLTracker | None = None,
     ) -> None:
         self._settings = settings if settings is not None else get_settings()
         self._client = client
@@ -272,6 +314,10 @@ class RoboExecutor:
         self._journal = journal if journal is not None else OrderJournal(clock=clock)
         self._mode = mode if mode is not None else self._settings.trading_mode
         self._clock = clock
+        # Without the tracker, square-off fills cannot be booked and session P&L prints
+        # ₹0.00 — the exact defect this wiring exists to kill. Optional only so legacy
+        # constructors keep working; production wires it.
+        self._pnl = pnl
         self._exit_attempted: set[str] = set()
 
         if self._mode is TradingMode.LIVE and client is None:
@@ -448,6 +494,31 @@ class RoboExecutor:
             rejected_detail=detail,
         )
 
+    def _record_bracket_entry(self, plan: BracketPlan) -> None:
+        """Register the position **with its protective levels**, not just a quantity.
+
+        The per-tick exit evaluator (:meth:`RiskEngine.check_exits`) can only act on
+        Stop Loss / Target levels it can see. Storing the absolute levels from leg A here
+        is what closes the loop: without this, a SHORT at ₹890.70 with an SL of ₹894.85
+        was invisible to every tick until 15:15 square-off.
+
+        Also re-arms the protective-exit dedup key for this instrument: ``_exit_attempted``
+        is deliberately session-scoped, but its scope is *per position*, not per symbol —
+        without this discard, a second trade on the same name later in the day would find
+        its exits suppressed forever by the first trade's marker.
+        """
+        entry_leg = plan.legs[0]
+        direction = "LONG" if plan.side.sign > ZERO else "SHORT"
+        self._positions.record_entry(
+            plan.symbol,
+            plan.total_quantity,
+            entry_price=entry_leg.entry_price,
+            direction=direction,
+            stop_loss=entry_leg.stop_loss_price,
+            target=entry_leg.target_price,
+        )
+        self._exit_attempted.discard(self.exit_key_for(plan.symbol))
+
     def _simulate(self, plan: BracketPlan, at: str) -> ExecutionReport:
         """PAPER mode: record exactly what would have been sent, and send nothing."""
         results = tuple(
@@ -464,7 +535,7 @@ class RoboExecutor:
             self._journal.decision(
                 "paper_order", order_tag=leg.order_tag, payload=self.payload_for(leg)
             )
-        self._positions.record_entry(plan.symbol, plan.total_quantity)
+        self._record_bracket_entry(plan)
         _log.info(
             "execution.paper_entry",
             symbol=plan.symbol,
@@ -564,8 +635,304 @@ class RoboExecutor:
             results=tuple(results),
         )
         if report.placed:
-            self._positions.record_entry(plan.symbol, report.quantity_placed)
+            self._record_bracket_entry(plan)
         return report
+
+    # ── P&L booking (the ₹0.00 square-off fix) ───────────────────────────────
+
+    def _book_exit(
+        self,
+        symbol: str,
+        exit_price: Decimal,
+        quantity: int,
+        charges: Decimal,
+    ) -> bool:
+        """Book realised P&L for a closed quantity against the stored entry record.
+
+        Returns True when booked. Returns False — and logs at CRITICAL instead of
+        booking a fake number — when there is no tracker, no entry record, or no entry
+        price basis. Silence here is exactly what produced the "+Rs.0.00" print.
+        """
+        if self._pnl is None:
+            _log.critical(
+                "execution.pnl_unbookable",
+                symbol=symbol,
+                reason="no PnLTracker wired into the executor",
+                action="reconcile realised P&L from broker statements",
+            )
+            return False
+        # Canonical key first; the registry itself also normalises, so a bare-symbol hit is
+        # guaranteed whenever a record exists under any spelling of this name.
+        canonical = normalize_symbol(symbol)
+        record = self._positions.get(canonical)
+        if record is None:
+            record = self._positions.get(symbol)
+        else:
+            symbol = canonical
+        if record is None or record.entry_price is None:
+            _log.critical(
+                "execution.pnl_unbookable",
+                symbol=symbol,
+                reason="no entry-price basis recorded for this position",
+                action="reconcile realised P&L from broker statements",
+            )
+            return False
+
+        direction_sign = ONE if record.direction == "LONG" else -ONE
+        amount = (exit_price - record.entry_price) * abs(quantity) * direction_sign
+        self._pnl.book_realised(amount, charges=charges)
+        self._journal.decision(
+            "pnl_booked",
+            symbol=symbol,
+            exit_price=str(exit_price),
+            entry_price=str(record.entry_price),
+            quantity=quantity,
+            realised=str(amount),
+            charges=str(charges),
+        )
+        _log.warning(
+            "execution.pnl_booked",
+            symbol=symbol,
+            realised=str(amount),
+            exit_price=str(exit_price),
+            entry_price=str(record.entry_price),
+            quantity=quantity,
+        )
+        return True
+
+    def on_fill(
+        self,
+        symbol: str,
+        exit_price: Decimal | str | int | float,
+        quantity: int,
+        *,
+        charges: Decimal | str | int | float = ZERO,
+        was_stop_out: bool = False,
+    ) -> bool:
+        """Order-update handler hook: book one confirmed exit fill.
+
+        Called by the Brain's order-update path when a fill arrives with a real price.
+        Prices go through :func:`~tachyon.risk.tracker.to_decimal`, so broker JSON
+        strings (``"890.70"``) and indicator floats are handled identically — the
+        type-cast error class behind the zero-P&L bug.
+
+        Returns:
+            True when the fill was booked against a known entry.
+        """
+        try:
+            price = to_decimal(exit_price)
+            fee = to_decimal(charges) if charges else ZERO
+        except ValueError as exc:
+            _log.critical(
+                "execution.fill_price_unusable",
+                symbol=symbol,
+                raw=repr(exit_price),
+                error=str(exc),
+                action="fill NOT booked — reconcile manually",
+            )
+            return False
+        booked = self._book_exit(symbol, price, quantity, fee)
+        if booked:
+            self._positions.record_exit(symbol, was_stop_out=was_stop_out)
+        return booked
+
+    # ── per-tick protective exits (the tick-to-exit loop) ────────────────────
+
+    def exit_key_for(self, symbol: str) -> str:
+        """Dedup key for an in-flight protective exit: token when known, else canonical symbol."""
+        item = self._settings.find_symbol(normalize_symbol(symbol))
+        if item is not None and item.token:
+            return item.token
+        return normalize_symbol(symbol)
+
+    async def execute_exit(self, decision: ExitDecision) -> ExitExecutionReport:
+        """Flatten one position immediately in response to a per-tick exit signal.
+
+        This is the tick-to-exit contract's execution half: :meth:`RiskEngine.check_exits`
+        decides, this transmits. MARKET order — the position must be gone, not priced at.
+
+        Idempotency is load-bearing. A second market exit does not close a position twice;
+        it **reverses** it, opening fresh naked risk (§6.5). So a token/symbol is marked
+        attempted the moment a placement is accepted *or* becomes unknown, exactly like
+        the square-off path. Only a definitive rejection leaves the key unmarked, which is
+        what lets the next tick retry.
+
+        Booking belongs entirely to the callers:
+        * PAPER — the Brain books via :meth:`StrategyBrain.on_position_closed` using the
+          triggering LTP (single booking authority; this method never touches P&L).
+        * LIVE — the fill reconciler (postback + order-book poller) books against the real
+          fill price. Pre-booking an estimate here would double with that fill.
+
+        Raises:
+            Nothing for an ordinary refusal — those come back as a report with
+            :attr:`ExitExecutionReport.status` of ``REJECTED`` or ``SUPPRESSED``.
+            Transport-level failures from the client propagate to the caller's guard;
+            they are never swallowed here.
+        """
+        symbol = normalize_symbol(decision.symbol)
+        record = self._positions.get(symbol)
+        if record is None:
+            # The registry already freed this slot — some other path (fill reconciler,
+            # square-off, an earlier accepted exit) closed it. Resending would reverse.
+            _log.warning(
+                "execution.exit_no_local_record",
+                symbol=symbol,
+                reason="position already closed locally — suppressing exit",
+            )
+            return ExitExecutionReport(
+                symbol=symbol,
+                reason=decision.reason.value,
+                status=EXIT_SUPPRESSED,
+                detail="no open local record",
+            )
+        quantity = record.quantity
+        key = self.exit_key_for(symbol)
+
+        if key in self._exit_attempted:
+            # Already exiting this session. Never resend: a duplicate would reverse the
+            # position rather than flatten it twice.
+            _log.warning(
+                "execution.exit_duplicate_suppressed",
+                symbol=symbol,
+                reason="exit already submitted for this instrument",
+            )
+            return ExitExecutionReport(
+                symbol=symbol,
+                reason=decision.reason.value,
+                status=EXIT_SUPPRESSED,
+                detail="duplicate exit suppressed",
+            )
+
+        item = self._settings.find_symbol(symbol)
+        if item is None:
+            _log.error(
+                "execution.exit_unknown_symbol",
+                symbol=symbol,
+                action="not on the watchlist — refusing to transmit blind",
+            )
+            return ExitExecutionReport(
+                symbol=symbol,
+                reason=decision.reason.value,
+                status=EXIT_REJECTED,
+                detail="symbol not on watchlist",
+            )
+
+        closing_side = Side.SELL if decision.direction == "LONG" else Side.BUY
+        payload = {
+            "variety": VARIETY_NORMAL,
+            "tradingsymbol": trading_symbol_for(item),
+            "symboltoken": item.token,
+            "transactiontype": closing_side.value,
+            "exchange": item.exchange,
+            "ordertype": ORDER_TYPE_MARKET,
+            "producttype": PRODUCT_BO,
+            "duration": DURATION_DAY,
+            "price": "0",
+            "quantity": str(abs(quantity)),
+            "ordertag": self._builder.sequencer.next_tag(),
+        }
+
+        if not self.is_live or self._client is None:
+            # PAPER: simulate the fill at the LTP that triggered the exit. Booking and
+            # registry cleanup are the Brain's job (on_position_closed) — this method
+            # only records what would have been sent.
+            self._exit_attempted.add(key)
+            self._journal.decision(
+                "paper_exit",
+                symbol=symbol,
+                reason=decision.reason.value,
+                ltp=str(decision.ltp),
+                quantity=abs(quantity),
+                payload=payload,
+            )
+            _log.info(
+                "execution.paper_exit",
+                symbol=symbol,
+                reason=decision.reason.value,
+                ltp=str(decision.ltp),
+                quantity=abs(quantity),
+            )
+            return ExitExecutionReport(
+                symbol=symbol,
+                reason=decision.reason.value,
+                status=EXIT_SUBMITTED,
+                simulated=True,
+                order_id=f"PAPER-EXIT-{key}",
+                order_tag=payload["ordertag"],
+                quantity=abs(quantity),
+            )
+
+        try:
+            response = await self._client.place_order(payload)
+        except UnknownOrderOutcomeError as exc:
+            # May be live at the broker: mark attempted so no tick retries into a reversal.
+            self._exit_attempted.add(key)
+            _log.critical(
+                "execution.exit_outcome_unknown",
+                symbol=symbol,
+                reason=decision.reason.value,
+                error=str(exc),
+                action="treating as submitted — reconcile before any further action",
+            )
+            return ExitExecutionReport(
+                symbol=symbol,
+                reason=decision.reason.value,
+                status=EXIT_SUPPRESSED,
+                detail=f"unknown outcome: {exc}",
+                order_tag=payload["ordertag"],
+                quantity=abs(quantity),
+            )
+
+        self._exit_attempted.add(key)
+        order_id = str(response.get("orderid", ""))
+        _log.critical(
+            "execution.exit_submitted",
+            symbol=symbol,
+            reason=decision.reason.value,
+            ltp=str(decision.ltp),
+            threshold=str(decision.threshold),
+            quantity=abs(quantity),
+            order_id=order_id,
+        )
+        return ExitExecutionReport(
+            symbol=symbol,
+            reason=decision.reason.value,
+            status=EXIT_SUBMITTED,
+            order_id=order_id,
+            order_tag=payload["ordertag"],
+            quantity=abs(quantity),
+        )
+
+    def _resolve_exit_price(
+        self,
+        position: BrokerPosition,
+        ltp_by_symbol: Mapping[str, Decimal | str | int | float] | None,
+    ) -> Decimal | None:
+        """Best-known price for an in-flight square-off exit, or ``None``.
+
+        Priority: caller-supplied live LTP, then the broker position row's own LTP.
+        ``None`` means genuinely nothing is known — the caller must defer booking to
+        reconciliation rather than inventing a price (that invention *is* the ₹0.00 bug).
+
+        The LTP map is keyed canonically before lookup, so a broker-spelled
+        ``"RELIANCE-EQ"`` position row still finds a ``"RELIANCE"`` entry and vice versa.
+        """
+        candidates: list[Any] = []
+        if ltp_by_symbol is not None:
+            canonical_map = {normalize_symbol(k): v for k, v in ltp_by_symbol.items()}
+            candidates.append(canonical_map.get(normalize_symbol(position.trading_symbol)))
+        raw = position.raw.get("ltp") if isinstance(position.raw, dict) else None
+        candidates.append(raw)
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            try:
+                price = to_decimal(candidate)
+            except ValueError:
+                continue
+            if price > ZERO:
+                return price
+        return None
 
     # ── stop management ──────────────────────────────────────────────────────
 
@@ -628,8 +995,19 @@ class RoboExecutor:
 
     # ── square-off ───────────────────────────────────────────────────────────
 
-    async def flatten_everything(self) -> FlattenReport:
+    async def flatten_everything(
+        self,
+        ltp_by_symbol: Mapping[str, Decimal | str | int | float] | None = None,
+    ) -> FlattenReport:
         """Cancel every working order and exit every open position (CLAUDE.md §1.1).
+
+        Args:
+            ltp_by_symbol: latest live prices, when the caller has them. Square-off exits
+                are MARKET orders, so fills are not known at submit time; booking uses the
+                best price available now (live LTP, then the broker position row's own LTP)
+                and is journalled as an estimate pending reconciliation. ``None`` entries
+                defer P&L booking to the order-update reconciler instead of booking ₹0.00 —
+                which is the exact bug this parameter exists to prevent.
 
         Returns a report whose :attr:`FlattenReport.is_flat` is True only when the broker
         confirms nothing is left. The watchdog retries on anything else.
@@ -648,7 +1026,7 @@ class RoboExecutor:
 
         errors: list[str] = []
         cancelled = await self._cancel_working_orders(errors)
-        exits = await self._exit_open_positions(errors)
+        exits = await self._exit_open_positions(errors, ltp_by_symbol=ltp_by_symbol)
 
         # Re-read the broker rather than trusting what we just sent. "We issued the cancels" is
         # not the same fact as "nothing is working", and only the second one ends the retry.
@@ -714,12 +1092,21 @@ class RoboExecutor:
                 cancelled += 1
         return cancelled
 
-    async def _exit_open_positions(self, errors: list[str]) -> int:
+    async def _exit_open_positions(
+        self,
+        errors: list[str],
+        *,
+        ltp_by_symbol: Mapping[str, Decimal | str | int | float] | None = None,
+    ) -> int:
         """Submit one market exit per open instrument. At most one per square-off.
 
         A second exit for the same instrument does not close it twice — it opens an equal and
         opposite position. So a token is marked as attempted the moment a placement is accepted
         *or* becomes unknown, and only a definitively rejected placement is retried.
+
+        On an accepted submission the realised P&L is booked immediately against the best
+        known price (live LTP, then the broker row's LTP). When neither exists, booking is
+        deferred to reconciliation with a CRITICAL log — never silently booked as ₹0.00.
         """
         assert self._client is not None  # noqa: S101 - LIVE-only path
         submitted = 0
@@ -758,6 +1145,22 @@ class RoboExecutor:
             else:
                 self._exit_attempted.add(key)
                 submitted += 1
+                exit_price = self._resolve_exit_price(position, ltp_by_symbol)
+                if exit_price is None:
+                    _log.critical(
+                        "execution.pnl_booking_deferred",
+                        trading_symbol=position.trading_symbol,
+                        reason="no live LTP and no price on the position row",
+                        action="P&L will be booked by the fill reconciler, not guessed",
+                    )
+                else:
+                    # MARKET exits are estimates until the fill lands; journalled as such.
+                    self._book_exit(
+                        position.trading_symbol,
+                        exit_price,
+                        abs(position.net_quantity),
+                        ZERO,
+                    )
                 _log.critical(
                     "execution.exit_submitted",
                     trading_symbol=position.trading_symbol,
@@ -769,6 +1172,7 @@ class RoboExecutor:
         self,
         loop: asyncio.AbstractEventLoop,
         timeout: float = SQUARE_OFF_TIMEOUT_SECONDS,
+        ltp_provider: Callable[[], Mapping[str, Decimal | str | int | float]] | None = None,
     ) -> Callable[[], None]:
         """Adapt :meth:`flatten_everything` for the square-off watchdog thread.
 
@@ -776,12 +1180,31 @@ class RoboExecutor:
         async, so the coroutine is submitted to the Brain's event loop and waited on from the
         thread. Blocking that thread is fine and intended — it has one job.
 
+        ``ltp_provider`` supplies the latest live prices at *attempt* time (the Brain keeps
+        per-tick LTPs). Square-off exits are MARKET orders — fills are not known at submit —
+        so booking falls back to these LTPs instead of ₹0.00; without them a 15:15 exit books
+        nothing until reconciliation, which is how "+Rs.0.00" prints happened.
+
         The returned callable raises unless the account is confirmed flat, which is exactly
         what :meth:`~tachyon.risk.watchdog.SquareOffWatchdog` needs in order to keep retrying.
         """
 
         def action() -> None:
-            future = asyncio.run_coroutine_threadsafe(self.flatten_everything(), loop)
+            ltp_map: Mapping[str, Decimal | str | int | float] | None = None
+            if ltp_provider is not None:
+                try:
+                    ltp_map = ltp_provider()
+                except Exception as exc:  # noqa: BLE001 - a bad snapshot must not block flatten
+                    _log.error(
+                        "execution.squareoff_ltp_snapshot_failed",
+                        error=str(exc),
+                        error_type=type(exc).__name__,
+                        action="flattening anyway; P&L booking defers to reconciliation",
+                    )
+                    ltp_map = None
+            future = asyncio.run_coroutine_threadsafe(
+                self.flatten_everything(ltp_by_symbol=ltp_map), loop
+            )
             report = future.result(timeout=timeout)
             if not report.is_flat:
                 raise NotFlatError(

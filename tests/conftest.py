@@ -30,6 +30,7 @@ from pathlib import Path
 import pytest
 
 from tachyon.core import config as config_module
+from tachyon.core import token_cache as token_cache_module
 from tachyon.persistence import tick_recorder as tick_recorder_module
 from tachyon.persistence import trade_logger as trade_logger_module
 
@@ -140,3 +141,22 @@ def _isolate_tick_output(tmp_path_factory: pytest.TempPathFactory) -> Iterator[N
         yield
     finally:
         tick_recorder_module.TICKS_DIR = original
+
+
+@pytest.fixture(autouse=True)
+def _isolate_token_cache(tmp_path: Path) -> Iterator[None]:
+    """Keep test logins away from the operator's real ``data/cache/session_token.json``.
+
+    Two hazards, one in each direction: a test that *wrote* a synthetic session into the real
+    cache would hand the next live boot a dead token, and a test that *read* the operator's
+    real cached session would skip its mock transport entirely and assert against whatever
+    the broker last issued. Function-scoped on purpose: a session-scoped directory would let
+    one test's saved cache leak into the next test's login. The module resolves the path at
+    call time, so redirecting the constant is enough.
+    """
+    original = token_cache_module.TOKEN_CACHE_PATH
+    token_cache_module.TOKEN_CACHE_PATH = tmp_path / "session_token.json"
+    try:
+        yield
+    finally:
+        token_cache_module.TOKEN_CACHE_PATH = original

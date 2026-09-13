@@ -35,7 +35,7 @@ A ``NaN`` anywhere in the arithmetic is treated as a breach, never as "unknown, 
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -45,10 +45,42 @@ from tachyon.core.clock import SYSTEM_CLOCK, Clock, now_ist
 from tachyon.core.constants import DAILY_LOSS_LIMIT_INR, REENTRY_COOLDOWN, TradingMode
 from tachyon.core.logger import get_logger
 from tachyon.core.state import DailyLock, StateMachine, TradingState
+from tachyon.core.symbols import normalize_symbol
 
 _log = get_logger(__name__)
 
 ZERO: Final[Decimal] = Decimal("0")
+
+DIRECTIONS: Final[tuple[str, str]] = ("LONG", "SHORT")
+
+
+def to_decimal(value: Decimal | str | int | float) -> Decimal:
+    """Convert broker/exchange values to ``Decimal`` without float contamination.
+
+    This is the choke point that kills the ``"+Rs.0.00"`` class of bug: prices arriving
+    as JSON strings (``"890.70"``), floats from indicators, or ints from quantities all
+    collapse to one exact type. ``float`` goes through ``str()`` first so ``Decimal(0.1)``
+    becomes ``Decimal('0.1')`` rather than its binary expansion.
+
+    Raises:
+        ValueError: on anything unparseable — callers at the risk boundary treat a bad
+            price as unknown state, never as zero.
+    """
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, str):
+        cleaned = value.strip().replace(",", "").replace("₹", "")
+        try:
+            return Decimal(cleaned)
+        except InvalidOperation as exc:
+            raise ValueError(f"cannot parse {value!r} as a Decimal price") from exc
+    if isinstance(value, bool):  # bool is an int subclass; reject explicitly
+        raise ValueError(f"boolean is not a price: {value!r}")
+    if isinstance(value, int):
+        return Decimal(value)
+    if isinstance(value, float):
+        return Decimal(str(value))
+    raise ValueError(f"unsupported price type {type(value).__name__}: {value!r}")
 
 
 def _is_undefined(value: Decimal) -> bool:
@@ -372,11 +404,103 @@ class PnLTracker:
 
 @dataclass(frozen=True, slots=True)
 class PositionRecord:
-    """One open position's bookkeeping."""
+    """One open position's bookkeeping, including its protective levels.
+
+    ``stop_loss`` / ``target`` are what the per-tick exit evaluation
+    (:meth:`PositionRegistry.evaluate_exits`) compares the live LTP against. They live on
+    the record — not in a strategy-local variable — precisely so that *some* monitored
+    component can act on them even when the strategy loop itself is stuck.
+    """
 
     symbol: str
     opened_at: datetime
     quantity: int
+    entry_price: Decimal | None = None
+    direction: str = "LONG"  # "LONG" | "SHORT"
+    stop_loss: Decimal | None = None
+    target: Decimal | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ExitSignal:
+    """A protective exit the tick evaluator demands. Raised by the risk gate."""
+
+    symbol: str
+    reason: str  # "STOP_LOSS_HIT" | "TARGET_HIT"
+    direction: str
+    quantity: int
+    ltp: Decimal
+    threshold: Decimal
+
+
+def evaluate_exits(
+    records: Mapping[str, PositionRecord],
+    ltp_by_symbol: Mapping[str, Decimal | str | int | float],
+) -> tuple[ExitSignal, ...]:
+    """Check every open position's LTP against its Stop Loss / Target.
+
+    Direction-aware: for a LONG the SL is breached *below* and the TP *above*; for a SHORT
+    both invert. The SHORT case is exactly what failed live (a short from ₹890.70 with an
+    SL at ₹894.85 rode all the way to ₹920+ because nothing inverted the comparison).
+
+    LTP values pass through :func:`to_decimal`, so broker strings and indicator floats
+    are handled identically. Symbols without a usable LTP are skipped here — the caller
+    decides fail-safe policy for unknown prices; this function only reports provable hits.
+
+    Both key sets pass through :func:`~tachyon.core.symbols.normalize_symbol` before
+    matching: a broker-spelled ``"RELIANCE-EQ"`` tick must evaluate against a record
+    stored as ``"RELIANCE"``, never silently miss it.
+    """
+    signals: list[ExitSignal] = []
+    ltp_by_key = {normalize_symbol(symbol): raw for symbol, raw in ltp_by_symbol.items()}
+    for symbol, record in records.items():
+        raw_ltp = ltp_by_key.get(normalize_symbol(symbol))
+        if raw_ltp is None:
+            continue
+        try:
+            ltp = to_decimal(raw_ltp)
+        except ValueError:
+            _log.warning("risk.exit_eval.unusable_ltp", symbol=symbol, raw=repr(raw_ltp))
+            continue
+
+        if record.stop_loss is not None:
+            breached = (
+                ltp <= record.stop_loss if record.direction == "LONG" else ltp >= record.stop_loss
+            )
+            if breached:
+                signals.append(
+                    ExitSignal(
+                        symbol=symbol,
+                        reason="STOP_LOSS_HIT",
+                        direction=record.direction,
+                        quantity=record.quantity,
+                        ltp=ltp,
+                        threshold=record.stop_loss,
+                    )
+                )
+                continue
+
+        if record.target is not None:
+            breached = ltp >= record.target if record.direction == "LONG" else ltp <= record.target
+            if breached:
+                signals.append(
+                    ExitSignal(
+                        symbol=symbol,
+                        reason="TARGET_HIT",
+                        direction=record.direction,
+                        quantity=record.quantity,
+                        ltp=ltp,
+                        threshold=record.target,
+                    )
+                )
+    return tuple(signals)
+
+
+def _to_direction(value: str) -> str:
+    upper = value.strip().upper()
+    if upper not in DIRECTIONS:
+        raise ValueError(f"direction must be one of {DIRECTIONS}, got {value!r}")
+    return upper
 
 
 class PositionRegistry:
@@ -387,6 +511,12 @@ class PositionRegistry:
     * how many positions are open (CLAUDE.md §4 — one trade at a time)
     * when a symbol was last stopped out (CLAUDE.md §8.1 — 30-minute cooldown, so a
       chopping market cannot stop us out of the same name repeatedly)
+
+    Every symbol argument is canonicalised through
+    :func:`~tachyon.core.symbols.normalize_symbol` before it touches the dictionaries,
+    so a caller holding a broker-spelled ``"RELIANCE-EQ"`` and one holding the bare
+    ``"RELIANCE"`` address the same record. A lookup that misses because of an ``-EQ``
+    suffix is exactly how square-off booked ₹0.00 while a position was open.
     """
 
     __slots__ = ("_cooldown", "_lock", "_open", "_stopped_out_at")
@@ -404,36 +534,67 @@ class PositionRegistry:
 
     def is_open(self, symbol: str) -> bool:
         with self._lock:
-            return symbol in self._open
+            return normalize_symbol(symbol) in self._open
 
     def open_symbols(self) -> frozenset[str]:
         with self._lock:
             return frozenset(self._open)
 
-    def record_entry(self, symbol: str, quantity: int, at: datetime | None = None) -> None:
+    def record_entry(
+        self,
+        symbol: str,
+        quantity: int,
+        *,
+        at: datetime | None = None,
+        entry_price: Decimal | str | int | float | None = None,
+        direction: str = "LONG",
+        stop_loss: Decimal | str | int | float | None = None,
+        target: Decimal | str | int | float | None = None,
+    ) -> None:
+        """Open a position. Protective levels are stored for per-tick exit evaluation."""
         moment = at if at is not None else now_ist()
+        key = normalize_symbol(symbol)
+        record = PositionRecord(
+            symbol=key,
+            opened_at=moment,
+            quantity=quantity,
+            entry_price=None if entry_price is None else to_decimal(entry_price),
+            direction=_to_direction(direction),
+            stop_loss=None if stop_loss is None else to_decimal(stop_loss),
+            target=None if target is None else to_decimal(target),
+        )
         with self._lock:
-            self._open[symbol] = PositionRecord(symbol=symbol, opened_at=moment, quantity=quantity)
-        _log.info("risk.position_opened", symbol=symbol, quantity=quantity)
+            self._open[key] = record
+        _log.info("risk.position_opened", symbol=key, quantity=quantity)
+
+    def get(self, symbol: str) -> PositionRecord | None:
+        with self._lock:
+            return self._open.get(normalize_symbol(symbol))
+
+    def records_snapshot(self) -> dict[str, PositionRecord]:
+        """Point-in-time copy of the open-position table, safe to iterate freely."""
+        with self._lock:
+            return dict(self._open)
 
     def record_exit(self, symbol: str, *, was_stop_out: bool, at: datetime | None = None) -> None:
         moment = at if at is not None else now_ist()
+        key = normalize_symbol(symbol)
         with self._lock:
-            self._open.pop(symbol, None)
+            self._open.pop(key, None)
             if was_stop_out:
-                self._stopped_out_at[symbol] = moment
-        _log.info("risk.position_closed", symbol=symbol, was_stop_out=was_stop_out)
+                self._stopped_out_at[key] = moment
+        _log.info("risk.position_closed", symbol=key, was_stop_out=was_stop_out)
 
     def in_cooldown(self, symbol: str, at: datetime | None = None) -> bool:
         """True if ``symbol`` was stopped out within the cooldown window."""
         moment = at if at is not None else now_ist()
         with self._lock:
-            stopped = self._stopped_out_at.get(symbol)
+            stopped = self._stopped_out_at.get(normalize_symbol(symbol))
         return stopped is not None and (moment - stopped) < self._cooldown
 
     def cooldown_until(self, symbol: str) -> datetime | None:
         with self._lock:
-            stopped = self._stopped_out_at.get(symbol)
+            stopped = self._stopped_out_at.get(normalize_symbol(symbol))
         return None if stopped is None else stopped + self._cooldown
 
     def reset_session(self) -> None:

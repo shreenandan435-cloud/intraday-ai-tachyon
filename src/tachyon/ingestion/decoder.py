@@ -210,9 +210,17 @@ def decode_token(raw: bytes) -> str:
     """Read the null-padded 25-byte ASCII token field.
 
     The field is fixed width and zero-padded, so trailing NULs must be stripped — otherwise
-    the token never matches the watchlist and every tick is silently discarded downstream.
+    the token never matches the watchlist (``"1190"`` vs ``"1190\\x00\\x00..."``) and every
+    tick is silently discarded downstream.
+
+    Implementation matches :func:`websocket_feed._parse_binary_packet`'s explicit contract::
+
+        token = raw_token.decode("ascii", errors="ignore").rstrip("\\x00").strip()
+
+    Belt-and-braces: any leading/trailing ASCII whitespace is also removed so a broker that
+    pads with spaces instead of NULs still yields the bare digits.
     """
-    return raw.split(b"\x00", 1)[0].decode("ascii", errors="replace")
+    return raw.decode("ascii", errors="ignore").rstrip("\x00").strip()
 
 
 def peek_mode(payload: bytes, offset: int = 0) -> int:

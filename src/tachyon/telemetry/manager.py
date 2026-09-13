@@ -15,18 +15,16 @@ import logging
 import logging.handlers
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any
 from pathlib import Path
-from typing import Any, Final, Optional
-from uuid import uuid4
+from typing import Any, Final
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from tachyon.core.clock import SYSTEM_CLOCK, Clock, now_ist
+from tachyon.core.clock import SYSTEM_CLOCK, Clock
 from tachyon.core.constants import PROJECT_ROOT
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -72,7 +70,7 @@ class JSONFormatter(logging.Formatter):
             if key not in {
                 "name", "msg", "args", "created", "filename", "funcName",
                 "levelname", "levelno", "lineno", "module", "msecs",
-                "message", "name", "pathname", "process", "processName",
+                "message", "pathname", "process", "processName",
                 "relativeCreated", "thread", "threadName", "exc_info",
                 "exc_text", "stack_info"
             }:
@@ -121,7 +119,7 @@ class CSVTradeLogger:
     def __init__(self, trades_dir: Path = TRADES_DIR):
         self._trades_dir = trades_dir
         self._trades_dir.mkdir(parents=True, exist_ok=True)
-        self._current_date: Optional[date] = None
+        self._current_date: date | None = None
         self._writer: Any = None
         self._file_handle: Any = None
         self._lock = threading.Lock()
@@ -149,7 +147,8 @@ class CSVTradeLogger:
 
             path = self._get_path(today)
             file_exists = path.exists()
-            self._file_handle = open(path, "a", newline="", encoding="utf-8")
+            # Long-lived daily CSV handle — rotated by _rotate(), closed in close().
+            self._file_handle = path.open("a", newline="", encoding="utf-8")  # noqa: SIM115
             self._writer = csv.writer(self._file_handle)
 
             if not file_exists:
@@ -204,14 +203,14 @@ class TelemetryConfig:
 class ParquetTelemetryLogger:
     """Buffered Parquet telemetry logger with periodic flush."""
 
-    def __init__(self, config: Optional[TelemetryConfig] = None):
+    def __init__(self, config: TelemetryConfig | None = None):
         self._config = config or TelemetryConfig()
         self._config.telemetry_dir.mkdir(parents=True, exist_ok=True)
 
         self._buffer: list[dict[str, Any]] = []
         self._lock = threading.Lock()
-        self._current_date: Optional[date] = None
-        self._flush_task: Optional[threading.Thread] = None
+        self._current_date: date | None = None
+        self._flush_task: threading.Thread | None = None
         self._running = False
 
     def start(self) -> None:

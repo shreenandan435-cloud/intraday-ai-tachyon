@@ -1,4 +1,4 @@
-"""Interactive master boot — budget prompt, pre-market scan, then the orchestrator.
+r"""Interactive master boot — budget prompt, pre-market scan, then the orchestrator.
 
 Run::
 

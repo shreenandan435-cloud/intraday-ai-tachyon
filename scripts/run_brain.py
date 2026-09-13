@@ -45,7 +45,7 @@ def _confirm_live(settings: Settings) -> bool:
     print("=" * 72)
     try:
         answer = input("  Type LIVE to confirm, anything else to abort: ").strip()
-    except EOFError, KeyboardInterrupt:
+    except (EOFError, KeyboardInterrupt):
         return False
     return answer == "LIVE"
 
@@ -63,7 +63,7 @@ def _install_signal_handlers(brain: StrategyBrain) -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, request_stop)
-        except NotImplementedError, AttributeError:
+        except (NotImplementedError, AttributeError):
             signal.signal(sig, lambda _s, _f: request_stop())
 
 

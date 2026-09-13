@@ -40,8 +40,8 @@ capital:
 
 watchlist:
   # ---------------------------------------------------------------------------
-  # GENERATED 2026-08-20T09:12:08+05:30 by tachyon.strategy.scanner.
-  # Source: top 4 by |gap%| from https://www.nseindia.com/api/market-data-pre-open?key=ALL (2093 considered, budget Rs.10000)
+  # GENERATED 2026-08-28T12:18:33+05:30 by tachyon.strategy.scanner.
+  # Source: top 4 by |gap%| from https://www.nseindia.com/api/market-data-pre-open?key=ALL (2072 considered, budget Rs.10000.0)
   #
   # Hand edits to this block are overwritten by the next boot_tachyon.py run. The
   # previous version of this whole file is kept at settings.yaml.bak, and the file is
@@ -52,10 +52,10 @@ watchlist:
   # (CLAUDE.md 2.3), so a symbol that reached this list has already been proved to
   # exist under the name it is written with.
   # ---------------------------------------------------------------------------
-  - {symbol: BLEL, token: "765291", exchange: NSE, tick_size: 0.05, lot_size: 1}
-  - {symbol: SHIPROCKET, token: "765282", exchange: NSE, tick_size: 0.01, lot_size: 1}
-  - {symbol: MILKYMIST, token: "765272", exchange: NSE, tick_size: 0.01, lot_size: 1}
-  - {symbol: SIGMAADV, token: "14793", exchange: NSE, tick_size: 0.05, lot_size: 1}
+  - {symbol: FMGOETZE, token: "1190", exchange: NSE, tick_size: 0.05, lot_size: 1}
+  - {symbol: TEJASNET, token: "21131", exchange: NSE, tick_size: 0.05, lot_size: 1}
+  - {symbol: RSL, token: "761439", exchange: NSE, tick_size: 0.01, lot_size: 1}
+  - {symbol: AGIIL, token: "24445", exchange: NSE, tick_size: 0.05, lot_size: 1}
 
 positions:
   max_concurrent: 2
@@ -120,6 +120,20 @@ sentinel:
 ui:
   ws_max_hz: 10
   stale_badge_after_seconds: 2
+
+rl:
+  # PPO training hyperparameters
+  lr: 3e-4
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_ratio: 0.2
+  value_clip: 0.2
+  entropy_coef: 0.01
+  max_grad_norm: 0.5
+  batch_size: 64
+  minibatch_size: 32
+  epochs: 4
+  device: "cpu"  # "cpu" or "cuda"
 
 logging:
   json_lines: true

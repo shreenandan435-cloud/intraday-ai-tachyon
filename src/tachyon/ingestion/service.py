@@ -8,6 +8,16 @@ This process contains **no business logic**. It computes no indicators, forms no
 places no orders. It must keep publishing when the Brain is dead, and it must survive anything
 downstream of the socket failing.
 
+Reconnect state continuity
+--------------------------
+Everything cumulative lives **here**, not in the WebSocket client: per-symbol sequence
+numbers (:class:`SequenceManager`), the token→symbol map, and these counters. The client
+reconnects and re-subscribes transparently, so a network blip costs a few ticks — never the
+session's running volume, VWAP inputs or monotonic ordering. The client additionally runs a
+tick-heartbeat watchdog (5 s without market data during market hours ⇒ forced reconnect);
+its ``stale_reconnects`` counter rides along in the silent-feed warning below.
+
+
 The heartbeat is gated on the subscription
 ---------------------------------------------
 A heartbeat published while the WebSocket is down would be actively dangerous. The Brain's
@@ -47,7 +57,7 @@ from tachyon.ingestion.ws_client import (
     SmartApiFeedClient,
     subscriptions_from_settings,
 )
-from tachyon.ipc.publisher import Publisher
+from tachyon.ipc.publisher import DEFAULT_SETTLE_SECONDS, Publisher
 from tachyon.ipc.schemas import OrderBook, Tick
 
 _log = get_logger(__name__)
@@ -150,6 +160,7 @@ class IngestionService:
             subscriptions_from_settings(self._settings),
             on_binary=self.handle_binary,
             mode=SubscriptionMode.SNAP_QUOTE,
+            url=self._settings.feed.stream_url,
             backoff_seconds=self._settings.feed.reconnect_backoff_seconds,
             max_attempts=self._settings.feed.max_reconnect_attempts,
         )
@@ -286,6 +297,8 @@ class IngestionService:
                 binary_frames=self._client.stats.binary_frames,
                 text_frames=self._client.stats.text_frames,
                 heartbeats=self.stats.heartbeats,
+                seconds_since_last_tick=self._client.seconds_since_last_tick,
+                stale_reconnects=self._client.stats.stale_reconnects,
                 meaning="the socket is up and subscribed but the broker has sent no market "
                 "data; heartbeats count our own liveness, not the feed's",
                 check="look for a feed.text_frame warning carrying the broker's rejection",
@@ -301,7 +314,9 @@ class IngestionService:
             heartbeat_interval=self._heartbeat_interval,
         )
         # Let subscribers finish connecting before the first tick (PUB/SUB slow joiner).
-        Publisher.settle()
+        # Await an async sleep: Publisher.settle() is a blocking time.sleep and must never
+        # run on the event loop, which is the tick path itself.
+        await asyncio.sleep(DEFAULT_SETTLE_SECONDS)
 
         feed = asyncio.create_task(self._client.run(), name="feed")
         heartbeat = asyncio.create_task(self._heartbeat_loop(), name="heartbeat")

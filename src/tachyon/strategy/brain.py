@@ -60,8 +60,10 @@ from tachyon.core.config import Settings, get_settings
 from tachyon.core.constants import WATCHDOG_TICK, TradingMode
 from tachyon.core.logger import get_logger
 from tachyon.core.state import DailyLock, StateMachine, TradingState
+from tachyon.core.symbols import normalize_symbol
 from tachyon.execution.api import SmartApiClient, SmartApiError
 from tachyon.execution.builder import BracketPlan, OrderBuilder, OrderRejected, Side
+from tachyon.execution.charges import estimate_charges
 from tachyon.execution.executor import RoboExecutor
 from tachyon.execution.journal import OrderJournal
 from tachyon.execution.reconciliation import OrderBookPoller, StateReconciler
@@ -83,7 +85,7 @@ from tachyon.math_engine.core import IndicatorSnapshot, TickAggregator
 from tachyon.math_engine.warmup import is_warm, warmup
 from tachyon.persistence.trade_logger import TRIGGER_VWAP_CONFLUENCE, TradeLogger
 from tachyon.risk.budget import SessionBudget
-from tachyon.risk.engine import RiskDecision, RiskEngine
+from tachyon.risk.engine import ExitDecision, RiskDecision, RiskEngine
 from tachyon.risk.tracker import PnLTracker, PositionRegistry, TripEvent
 from tachyon.risk.watchdog import SquareOffAction, SquareOffWatchdog
 from tachyon.sentinel.service import SentinelDaemon
@@ -92,7 +94,7 @@ from tachyon.strategy.cooldown import ReentryManager
 from tachyon.strategy.signals import Signal, SignalGenerator, SignalReport
 from tachyon.strategy.telemetry import StatePublisher, money
 from tachyon.ui.postback import OrderStatusListener, OrderUpdate, watchlist_resolver
-from tachyon.utils.telegram_alerts import TelegramAlerter
+from tachyon.utils.telegram_alerts import AlertKind, TelegramAlerter
 
 _log = get_logger(__name__)
 
@@ -108,6 +110,9 @@ LIVENESS_INTERVAL_SECONDS: Final[float] = WATCHDOG_TICK.total_seconds()
 #: is synchronous by contract (it runs on the entry path and may not await), so it reads a
 #: cached value that this task refreshes.
 MARGIN_REFRESH_SECONDS: Final[float] = 30.0
+
+ZERO: Final[Decimal] = Decimal("0")
+ONE: Final[Decimal] = Decimal("1")
 
 
 @dataclass(slots=True)
@@ -165,9 +170,12 @@ class StrategyBrain:
         "_entries_in_flight",
         "_entry_tasks",
         "_executor",
+        "_exit_tasks",
+        "_exits_in_flight",
         "_generator",
         "_fills",
         "_journal",
+        "_latest_ltp",
         "_macro",
         "_margin",
         "_monitor",
@@ -179,6 +187,7 @@ class StrategyBrain:
         "_risk",
         "_sentinel",
         "_settings",
+        "_shutdown_done",
         "_state",
         "_state_publisher",
         "_stopping",
@@ -270,6 +279,9 @@ class StrategyBrain:
             # leaves the check inert rather than vetoing everything before the first poll.
             margin_provider=self._current_margin if mode is TradingMode.LIVE else None,
             macro_state=self._macro,
+            # In-memory (ltp, session_vwap) for the overextension guardrail — same snapshot
+            # values the signal generator just used, no extra I/O on the entry path.
+            quote_provider=self._quote_view,
         )
 
         # ── strategy ─────────────────────────────────────────────────────────
@@ -311,12 +323,36 @@ class StrategyBrain:
         # The drawdown hard-stop rides on the watchdog rather than only on the P&L update path.
         # That thread is non-daemon, immortal and monotonic-clocked, so the limit is enforced
         # even if the event loop wedges or the feed dies mid-position (CLAUDE.md §1.1).
+        # The deadline is 15:15:00 IST (AUTO_SQUAREOFF_IST), unconditionally: with no
+        # override the watchdog arms the §1 constant and nothing else. The only deviation
+        # is settings.mock_squareoff_time, which main.py populates solely behind the
+        # explicit --mock flag for offline rehearsals — normal execution never sets it,
+        # and a blank or malformed value keeps 15:15 in force rather than moving it.
+        _override_time = None
+        _raw_override = (getattr(self._settings, "mock_squareoff_time", None) or "").strip()
+        if _raw_override:
+            try:
+                _override_time = datetime.strptime(_raw_override, "%H:%M").time()
+            except ValueError:
+                _log.warning(
+                    "brain.squareoff_override_invalid",
+                    value=_raw_override,
+                    action="ignored — the 15:15 IST deadline stands",
+                )
+            else:
+                _log.critical(
+                    "brain.squareoff_override_armed",
+                    deadline=_override_time.strftime("%H:%M:%S"),
+                    action="MOCK MODE — square-off deadline moved off 15:15 IST; "
+                    "never valid against a live broker",
+                )
         self._watchdog = SquareOffWatchdog(
             self._state,
             clock=clock,
             drawdown_probe=lambda: self._pnl.total,
             drawdown_limit=self._budget.daily_loss_limit,
             on_drawdown_breach=self._on_drawdown_breach,
+            squareoff_override_time=_override_time,
         )
 
         # ── telemetry + fills (Phase 10) ─────────────────────────────────────
@@ -372,8 +408,22 @@ class StrategyBrain:
         self._symbols: dict[str, _SymbolState] = {}
         self._entries_in_flight: set[str] = set()
         self._entry_tasks: set[asyncio.Task[None]] = set()
+        # ── tick-to-exit state (the missed-558.70 fix) ────────────────────────
+        #: Latest tick LTP per canonical symbol. Written every tick; read by the per-tick
+        #: exit guard and by mark-to-market. Decimal(str(float)) keeps prices exact at the
+        #: risk boundary (CLAUDE.md §8).
+        self._latest_ltp: dict[str, Decimal] = {}
+        #: Symbols with a protective exit already dispatched. Checked and set synchronously
+        #: in the tick handler, so two ticks can never both launch an exit for one symbol.
+        self._exits_in_flight: set[str] = set()
+        self._exit_tasks: set[asyncio.Task[None]] = set()
         self._tasks: list[asyncio.Task[None]] = []
         self._stopping = asyncio.Event()
+        #: Latch making :meth:`shutdown` idempotent. The coordinator phase, this class's own
+        #: ``run()`` finally, and the orchestrator's teardown may each invoke shutdown; only
+        #: the first may run the teardown, the rest must be no-ops (no double close of the
+        #: subscriber/trades/alerts).
+        self._shutdown_done = False
         self.stats = BrainStats()
 
     # ── inspection ───────────────────────────────────────────────────────────
@@ -464,7 +514,15 @@ class StrategyBrain:
 
         loop = asyncio.get_running_loop()
         self._watchdog.set_square_off_action(
-            self._alerting_square_off(self._executor.square_off_action(loop))
+            self._alerting_square_off(
+                self._executor.square_off_action(
+                    loop,
+                    # Live LTPs at attempt time: 15:15 MARKET exits book against the last
+                    # seen price instead of deferring (or worse, ₹0.00) when no fill has
+                    # landed yet.
+                    ltp_provider=self._latest_ltp_snapshot,
+                )
+            )
         )
         self._watchdog.start()
 
@@ -632,8 +690,24 @@ class StrategyBrain:
             return
 
         self.stats.ticks += 1
+        # Record the LTP *before* anything else. This map is what the per-tick exit guard
+        # and mark-to-market read; a tick that arrives must instantly be visible to both,
+        # whatever else happens downstream.
+        canonical = normalize_symbol(symbol)
+        self._latest_ltp[canonical] = Decimal(str(tick.ltp))
+
         state.aggregator.on_tick(tick)
         state.ticks_since_eval += 1
+
+        # Feed the risk gate's VWAP z-score accumulator with the same differenced print the
+        # aggregator just consumed. observe_tick is fail-safe and O(1); its verdict is what
+        # check 12 consults before authorising a LONG.
+        self._risk.observe_tick(canonical, tick.ltp, state.aggregator.last_volume_delta)
+
+        # ── tick-to-exit (the missed-558.70 / rode-past-the-stop fix) ─────────
+        # Every single tick is evaluated against open positions. check_exits is pure and
+        # allocation-light; with no positions open it costs one integer comparison.
+        self._guard_open_positions()
 
         candles = state.aggregator.candle_count
         candle_closed = candles != state.last_candle_count
@@ -645,6 +719,189 @@ class StrategyBrain:
         ):
             state.ticks_since_eval = 0
             self._evaluate(symbol, state)
+
+    def _quote_view(self, symbol: str) -> tuple[float, float] | None:
+        """Latest ``(ltp, session_vwap)`` for the risk gate's overextension check.
+
+        Synchronous and I/O-free by contract: it reads aggregator state the tick loop just
+        wrote. ``None`` when the symbol is unknown to this Brain.
+
+        Reads the two O(1) running accumulators directly. ``snapshot()`` would recompute
+        every indicator — five JIT passes over up to 2000 ticks — only to discard all but
+        these two values, and this provider is consulted on the entry path.
+        """
+        state = self._symbols.get(normalize_symbol(symbol))
+        if state is None:
+            return None
+        aggregator = state.aggregator
+        if aggregator.session_vwap_valid:
+            return (aggregator.ltp, aggregator.session_vwap)
+        return None
+
+    def _latest_ltp_snapshot(self) -> dict[str, Decimal]:
+        """Point-in-time copy of the live LTP map, for square-off booking."""
+        return dict(self._latest_ltp)
+
+    def _guard_open_positions(self) -> None:
+        """Evaluate every open position against the latest ticks. Never raises.
+
+        Runs on **every** tick — that is the entire point. The 558.70-target incident and
+        the SHORT-ridden-past-its-stop incident both happened because SL/TP comparisons ran
+        on a slow strategy cadence or not at all. Here they run at tick rate; only the
+        resulting order placement leaves the loop, as its own task.
+        """
+        if self._positions.open_count == 0:
+            return
+        try:
+            decisions = self._risk.check_exits(self._latest_ltp)
+        except Exception as exc:  # noqa: BLE001 - the tick loop must survive a guard bug
+            _log.critical(
+                "brain.exit_guard_failed",
+                error=str(exc),
+                error_type=type(exc).__name__,
+                action="absorbed; next tick re-evaluates",
+                exc_info=True,
+            )
+            return
+        for decision in decisions:
+            self._dispatch_exit(decision)
+
+    def _dispatch_exit(self, decision: ExitDecision) -> None:
+        """Launch one protective exit as its own task, exactly once per symbol.
+
+        The in-flight marker is checked and set synchronously — no await between test and
+        set — so two consecutive ticks cannot both dispatch an exit for the same position
+        and turn one flatten into a flatten-plus-reversal. The task itself owns the marker
+        afterwards; see :meth:`_execute_protective_exit`.
+        """
+        symbol = normalize_symbol(decision.symbol)
+        if symbol in self._exits_in_flight:
+            return
+        self._exits_in_flight.add(symbol)
+        _log.warning(
+            "brain.exit_dispatched",
+            symbol=symbol,
+            reason=decision.reason.value,
+            direction=decision.direction,
+            quantity=decision.quantity,
+            ltp=str(decision.ltp),
+            threshold=str(decision.threshold),
+        )
+        task = asyncio.create_task(
+            self._execute_protective_exit(decision), name=f"brain-exit-{symbol}"
+        )
+        self._exit_tasks.add(task)
+        task.add_done_callback(self._exit_tasks.discard)
+
+    async def _execute_protective_exit(self, decision: ExitDecision) -> None:
+        """Transmit a protective exit off the tick path, then book per mode. Never raises.
+
+        PAPER books here and now — there is no broker fill stream coming — through the same
+        :meth:`on_position_closed` authority the fill listener uses, so cooldowns, the
+        registry and realised P&L move exactly once.
+
+        LIVE registers the exit order with the fill listener and lets the reconciler book
+        against the real fill price. Booking an LTP estimate here would double with that
+        fill seconds later.
+        """
+        symbol = normalize_symbol(decision.symbol)
+        was_stop_out = decision.reason.value == "STOP_LOSS_HIT"
+        quantity = abs(decision.quantity)
+        try:
+            report = await self._executor.execute_exit(decision)
+        except Exception as exc:  # noqa: BLE001 - an exit failure must not kill the tick loop
+            _log.critical(
+                "brain.exit_raised",
+                symbol=symbol,
+                reason=decision.reason.value,
+                error=str(exc),
+                error_type=type(exc).__name__,
+                action="position remains open — next tick retries unless already attempted",
+                exc_info=True,
+            )
+            # Bound to a local before the lambda: `except ... as exc` unbinds `exc` at the
+            # end of the block, so a plain closure would raise NameError when the alerter
+            # got round to it.
+            detail = f"protective exit {symbol} raised {type(exc).__name__}: {exc}"
+            self._alert(lambda: self._alerts.square_off_failed(detail=detail))
+            if not self._positions.is_open(symbol):
+                self._exits_in_flight.discard(symbol)
+            return
+
+        if report.accepted:
+            if report.simulated:
+                self._book_paper_exit(decision, report.quantity, was_stop_out)
+            else:
+                # LIVE: the fill that lands will flow through the postback/poller into
+                # on_position_closed. Registering the order is what makes its fill ours.
+                self._fills.register_order(report.order_id, report.order_tag)
+                self._trades.note_order_placed(
+                    report.order_id, trigger_reason=f"PROTECTIVE_{decision.reason.value}"
+                )
+                kind = AlertKind.STOP_LOSS if was_stop_out else AlertKind.TARGET
+                self._alert(
+                    lambda: self._alerts.send(
+                        f"<b>{symbol}</b> {decision.reason.value} exit submitted x{quantity}\n"
+                        f"ltp Rs.{decision.ltp:,.2f}  threshold Rs.{decision.threshold:,.2f} "
+                        f"(order {report.order_id or 'pending'})",
+                        kind,
+                    ),
+                )
+
+        # Marker policy. Submitted/suppressed: keep holding while the position still shows
+        # open, so later ticks do not re-dispatch into a possible reversal; the registry
+        # freeing (via fill closure or square-off) releases it. Rejected: release now, so
+        # the next tick can retry against a possibly recovered broker.
+        if report.retriable or not self._positions.is_open(symbol):
+            self._exits_in_flight.discard(symbol)
+
+    def _book_paper_exit(
+        self, decision: ExitDecision, quantity: int, was_stop_out: bool
+    ) -> None:
+        """Book a completed PAPER protective exit through the single close authority."""
+        symbol = normalize_symbol(decision.symbol)
+        record = self._positions.get(symbol)
+        entry_price = record.entry_price if record is not None else None
+        direction_sign = ONE if decision.direction == "LONG" else -ONE
+        gross = (
+            (decision.ltp - entry_price) * abs(quantity) * direction_sign
+            if entry_price is not None
+            else ZERO
+        )
+        buy_turnover = abs(quantity) * (entry_price if entry_price is not None else decision.ltp)
+        sell_turnover = abs(quantity) * decision.ltp
+        if decision.direction == "SHORT":
+            buy_turnover, sell_turnover = sell_turnover, buy_turnover
+        charges = estimate_charges(
+            buy_turnover=buy_turnover, sell_turnover=sell_turnover, orders=2
+        ).total
+        # Order matters, as in on_position_closed: cooldown first, then free the slot, then
+        # book — no instant where the symbol looks flat and cooldown-free.
+        self.on_position_closed(
+            symbol,
+            realised_inr=gross,
+            charges_inr=charges,
+            was_stop_out=was_stop_out,
+        )
+        self._trades.record_close(symbol, gross, charges, was_stop_out)
+        self._state_publisher.publish_risk(
+            "EXIT",
+            symbol,
+            decision.reason.value,
+            f"ltp={decision.ltp} threshold={decision.threshold} "
+            f"realised={gross} charges={charges}",
+            severity="WARNING",
+        )
+        self._alert(
+            lambda: self._alerts.position_closed(
+                symbol=symbol,
+                realised=gross,
+                charges=charges,
+                was_stop_out=was_stop_out,
+                session_total=self._pnl.total,
+                headroom=self._pnl.headroom,
+            )
+        )
 
     def _on_depth(self, symbol: str, book: OrderBook) -> None:
         state = self._symbols.get(symbol)
@@ -692,7 +949,13 @@ class StrategyBrain:
             _log.info("brain.cooldown_block", symbol=symbol, detail=verdict.detail)
             return
 
-        decision = self._risk.evaluate(symbol)
+        decision = self._risk.evaluate(
+            symbol,
+            direction="LONG" if report.signal is Signal.LONG else "SHORT",
+            # The exact (ltp, session_vwap) this signal was derived from — the guardrail
+            # judges those numbers, not a re-read that could have drifted.
+            quote=(report.ltp, report.session_vwap),
+        )
         if not decision.allowed:
             self.stats.risk_vetoes += 1
             # Already logged with its reason by the gate itself; persisted for the post-mortem,
@@ -1053,12 +1316,32 @@ class StrategyBrain:
         while not self._stopping.is_set():
             try:
                 self._monitor.check()
+                self._update_mark_to_market()
                 self._honour_external_lock()
                 self.publish_telemetry()
             except Exception as exc:  # noqa: BLE001 - liveness must not die quietly
                 _log.error("brain.liveness_failed", error=str(exc), exc_info=True)
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._stopping.wait(), timeout=LIVENESS_INTERVAL_SECONDS)
+
+    def _update_mark_to_market(self) -> None:
+        """Refresh floating P&L from the latest ticks (CLAUDE.md §1.2).
+
+        Feeds two consumers that must never run on a stale number: the drawdown hard-stop's
+        probe (the watchdog thread reads ``self._pnl.total``) and 15:15 square-off booking.
+        Positions without a tick yet this session are skipped — an absent price is unknown,
+        not zero.
+        """
+        if self._positions.open_count == 0:
+            return
+        floating = ZERO
+        for symbol, record in self._positions.records_snapshot().items():
+            ltp = self._latest_ltp.get(normalize_symbol(symbol))
+            if ltp is None or record.entry_price is None or record.quantity <= 0:
+                continue
+            sign = ONE if record.direction == "LONG" else -ONE
+            floating += (ltp - record.entry_price) * Decimal(record.quantity) * sign
+        self.on_mark_to_market(floating)
 
     def _honour_external_lock(self) -> None:
         """Adopt a daily lock written by another process — the UI's panic button (§7.3).
@@ -1114,15 +1397,24 @@ class StrategyBrain:
 
         The watchdog is stopped **last**: it is a non-daemon thread whose entire purpose is to
         flatten during shutdown (CLAUDE.md §1.1), so it must outlive the components it drives.
+
+        Idempotent: the shutdown phase, ``run()``'s own finally and the orchestrator teardown
+        can each reach this method. Only the first invocation runs the teardown; the check and
+        the latch are set with no await between them, so two coroutines cannot both enter.
         """
+        if self._shutdown_done:
+            return
+        self._shutdown_done = True
         self._stopping.set()
 
         # In-flight entries are awaited, not cancelled. Cancelling a coroutine that is halfway
         # through a placement produces exactly the state CLAUDE.md §6.4 exists to prevent: an
-        # order that may or may not be live, with nothing recorded either way.
-        if self._entry_tasks:
-            _log.warning("brain.awaiting_entries", count=len(self._entry_tasks))
-            await asyncio.gather(*tuple(self._entry_tasks), return_exceptions=True)
+        # order that may or may not be live, with nothing recorded either way. The same logic
+        # applies to in-flight protective exits — arguably more.
+        pending_lifecycles = tuple(self._entry_tasks) + tuple(self._exit_tasks)
+        if pending_lifecycles:
+            _log.warning("brain.awaiting_orders", count=len(pending_lifecycles))
+            await asyncio.gather(*pending_lifecycles, return_exceptions=True)
 
         # Asked to stop before its task is cancelled, so it closes its HTTP client cleanly
         # rather than leaving a socket for the loop to complain about at teardown.
@@ -1174,4 +1466,5 @@ class StrategyBrain:
         self._fills.reset_session()
         self._positions.reset_session()
         self._pnl.reset_session()
+        self._risk.reset_vwap_session()
         self.stats = BrainStats()

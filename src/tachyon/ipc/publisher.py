@@ -93,6 +93,10 @@ class Publisher:
         self._ctx: zmq.Context[zmq.Socket[bytes]] = zmq.Context() if context is None else context
         self._socket: zmq.Socket[bytes] = self._ctx.socket(zmq.PUB)
         self._socket.setsockopt(zmq.SNDHWM, hwm)
+        # LINGER is set once, honouring the caller's value. libzmq already applies
+        # SO_REUSEADDR to TCP binds internally, and pyzmq exposes no SO_REUSEADDR socket
+        # option (hasattr(zmq, "SO_REUSEADDR") is False), so a manual set is dead code that
+        # only pretends to guard against EADDRINUSE on rapid restarts.
         self._socket.setsockopt(zmq.LINGER, linger_ms)
         self._socket.bind(self.endpoint)
 

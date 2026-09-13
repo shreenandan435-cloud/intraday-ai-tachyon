@@ -26,6 +26,19 @@ trading — the model increasing risk, which §5 forbids outright. Only
 The symbol blacklist is the same shape with an expiry: a news score above the threshold blocks
 new entries in that symbol for 30 minutes. It expires because it is about one headline, not
 about the day.
+
+Degradation and recovery
+------------------------
+A failed classification sets ``degraded`` and increments ``consecutive_failures``; the very
+next **successful** :meth:`apply` clears both and emits a ``sentinel.recovered`` event. The
+poller therefore cannot get stuck in "NEUTRAL (DEGRADED)" forever: every cycle re-attempts,
+and one good response ends the degraded state — non-blocking, timeout-guarded upstream in
+:mod:`tachyon.sentinel.api`.
+
+What recovery deliberately does **not** do: relax any ratchet. ``is_trading_allowed`` stays
+``False`` and ``size_multiplier`` stays down once a confident RISK_OFF has landed, no matter
+how many healthy responses follow. Only :meth:`reset_session` (09:15) touches those. A model
+that said RISK_OFF at 10:00 does not get to un-say it at 10:15 because connectivity came back.
 """
 
 from __future__ import annotations
@@ -71,6 +84,7 @@ class MacroSnapshot:
     blacklisted_symbols: tuple[str, ...]
     updates: int
     failures: int
+    consecutive_failures: int
     degraded: bool
     """True when the last classification attempt failed. Trading continues regardless."""
 
@@ -110,7 +124,9 @@ class MacroState:
 
     updates: int = 0
     failures: int = 0
+    consecutive_failures: int = 0
     degraded: bool = False
+    degraded_since: datetime | None = None
 
     _blacklist: dict[str, datetime] = field(default_factory=dict, repr=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
@@ -129,8 +145,14 @@ class MacroState:
                 blacklisted_symbols=tuple(sorted(self._live_blacklist())),
                 updates=self.updates,
                 failures=self.failures,
+                consecutive_failures=self.consecutive_failures,
                 degraded=self.degraded,
             )
+
+    @property
+    def is_degraded(self) -> bool:
+        """True when the last classification attempt failed. Advisory only."""
+        return self.degraded
 
     def _live_blacklist(self, at: datetime | None = None) -> dict[str, datetime]:
         """Blacklist entries that have not yet expired. Caller holds the lock."""
@@ -184,12 +206,17 @@ class MacroState:
 
         newly_blocked = False
         with self._lock:
+            was_degraded = self.degraded
+            degraded_since = self.degraded_since
+
             self.regime = regime
             self.confidence = confidence
             self.reason = reason
             self.updated_at_ist = now_ist(self.clock)
             self.updates += 1
             self.degraded = False
+            self.consecutive_failures = 0
+            self.degraded_since = None
 
             # Ratchet: never let a later, cheerier reading restore size or unblock trading.
             if target < self.size_multiplier:
@@ -198,6 +225,21 @@ class MacroState:
                 newly_blocked = self.is_trading_allowed
                 self.is_trading_allowed = False
 
+        if was_degraded:
+            # Recovery telemetry: the poller escaped DEGRADED on its own — no operator
+            # action, no latch touched. Ratchets above were deliberately left alone.
+            downtime_seconds: float | None = None
+            if degraded_since is not None and self.updated_at_ist is not None:
+                seconds = (self.updated_at_ist - degraded_since).total_seconds()
+                downtime_seconds = round(max(seconds, 0.0), 1)
+            _log.info(
+                "sentinel.recovered",
+                downtime_seconds=downtime_seconds,
+                regime=regime,
+                confidence=confidence,
+                note="degraded state cleared by a successful classification; session "
+                "ratchets were intentionally NOT relaxed",
+            )
         if newly_blocked:
             _log.critical(
                 "sentinel.risk_off",
@@ -222,18 +264,27 @@ class MacroState:
         The regime, the multiplier and the trading flag are left exactly as they were. An
         outage must not halt the session — the Sentinel is advisory (CLAUDE.md §5) — and it
         must equally not relax anything that a previous, successful reading tightened.
+
+        The next successful :meth:`apply` clears the degraded state automatically; there is
+        no operator step and no latch to break.
         """
         with self._lock:
             self.failures += 1
+            self.consecutive_failures += 1
+            if self.degraded_since is None:
+                self.degraded_since = now_ist(self.clock)
             self.degraded = True
             failures = self.failures
+            consecutive = self.consecutive_failures
         _log.warning(
             "sentinel.degraded",
             detail=detail,
             failures=failures,
+            consecutive_failures=consecutive,
             retained_regime=self.regime,
             trading_allowed=self.is_trading_allowed,
-            impact="trading continues under the last known good report",
+            impact="trading continues under the last known good report; "
+            "the next successful poll recovers automatically",
         )
 
     def blacklist(self, symbol: str, reason: str, at: datetime | None = None) -> datetime:
@@ -271,5 +322,7 @@ class MacroState:
             self.size_multiplier = ONE
             self.updates = 0
             self.failures = 0
+            self.consecutive_failures = 0
             self.degraded = False
+            self.degraded_since = None
             self._blacklist.clear()

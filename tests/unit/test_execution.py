@@ -19,14 +19,21 @@ position, and a placement retried when its outcome is unknown.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import os
+import re
+import socket
+from collections.abc import Iterator
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import httpx
+import pyotp
 import pytest
 
+from tachyon.core import token_cache
 from tachyon.core.clock import IST, ManualClock
 from tachyon.core.config import (
     ExecutionSettings,
@@ -951,6 +958,393 @@ class TestSmartApiClient:
             await client.login()
         await client.aclose()
 
+    async def test_login_sends_every_header_the_waf_requires(self) -> None:
+        """Angel One's edge firewall 403s a login that is missing any of these."""
+        settings = _settings(
+            smartapi_client_code="ABC123",
+            smartapi_password="1234",
+            smartapi_totp_secret="JBSWY3DPEHPK3PXP",
+            smartapi_api_key="key-value",
+        )
+        seen: dict[str, str] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.update(dict(request.headers))
+            return _ok({"jwtToken": "jwt", "refreshToken": "r", "feedToken": "f"})
+
+        client = _client(handler, settings=settings)
+        await client.login()
+        await client.aclose()
+
+        assert seen["content-type"] == "application/json"
+        assert seen["accept"] == "application/json"
+        assert seen["x-privatekey"] == "key-value"  # SMARTAPI_API_KEY
+        assert seen["x-usertype"] == "USER"
+        assert seen["x-sourceid"] == "WEB"
+        assert seen["x-clientlocalip"] == "1.2.3.4"
+        assert seen["x-clientpublicip"] == "1.2.3.4"
+        assert seen["x-macaddress"] == "AA:BB"
+        assert "authorization" not in seen  # the login itself is unauthenticated
+
+    def test_client_identity_falls_back_to_a_dummy_when_there_is_no_egress(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def no_socket(*args: Any, **kwargs: Any) -> Any:
+            raise OSError("no route to host")
+
+        monkeypatch.setattr(socket, "socket", no_socket)
+        identity = ClientIdentity.detect()
+        # Loopback would be 403ed by the WAF, so the fallback is a dummy LAN address.
+        assert identity.local_ip == "192.168.1.1"
+        # ``public_ip`` is the WAF-whitelisted Giganode egress, independent of the
+        # local LAN — the broker does not care what the LAN address is, only what
+        # address reaches it. Reporting the LAN address here is the failure mode
+        # that produced the original HTTP 401/403 from the WAF.
+        assert identity.public_ip == "87.76.191.175"
+        assert re.fullmatch(r"(?:[0-9A-F]{2}:){5}[0-9A-F]{2}", identity.mac_address)
+
+    def test_client_identity_rejects_a_loopback_egress(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class LoopbackProbe:
+            def settimeout(self, seconds: float) -> None:
+                pass
+
+            def connect(self, address: Any) -> None:
+                pass
+
+            def getsockname(self) -> tuple[str, int]:
+                return ("127.0.0.1", 0)
+
+            def __enter__(self) -> LoopbackProbe:
+                return self
+
+            def __exit__(self, *exc_info: Any) -> None:
+                pass
+
+        monkeypatch.setattr(socket, "socket", lambda *args, **kwargs: LoopbackProbe())
+        identity = ClientIdentity.detect()
+        assert identity.local_ip == "192.168.1.1"
+        # The loopback detection still applies to ``local_ip`` (an informational
+        # header), but ``public_ip`` is the static egress IP — not derived from
+        # the detected interface, never the LAN.
+        assert identity.public_ip == "87.76.191.175"
+
+    def test_client_identity_honours_angel_public_ip_override(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ANGEL_PUBLIC_IP", "203.0.113.42")
+        try:
+            identity = ClientIdentity.detect()
+            assert identity.public_ip == "203.0.113.42"
+        finally:
+            monkeypatch.delenv("ANGEL_PUBLIC_IP", raising=False)
+
+    async def test_totp_survives_whitespace_and_missing_padding(self) -> None:
+        """Secrets pasted from authenticator exports lose padding and gain spaces."""
+        settings = _settings(smartapi_totp_secret=" jbsw y3dp ehpk 3px ")
+        client = _client(lambda request: _ok({}), settings=settings)
+        expected = str(pyotp.TOTP("JBSWY3DPEHPK3PX=").now())
+        assert client.current_totp() == expected
+        await client.aclose()
+
+    async def test_a_waf_block_surfaces_its_rejection_text(self, journal: OrderJournal) -> None:
+        html = (
+            "<html><head><title>Access Denied</title></head><body>  Access   Denied  </body></html>"
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(403, text=html, headers={"Content-Type": "text/html"})
+
+        settings = _settings(
+            smartapi_client_code="ABC123",
+            smartapi_password="1234",
+            smartapi_totp_secret="JBSWY3DPEHPK3PXP",
+        )
+        client = _client(handler, journal=journal, settings=settings)
+        # A rejected *session* request is an auth failure, not an unknown order outcome —
+        # and this is the shape the login backoff inspects for the rate-limit phrase.
+        with pytest.raises(SmartApiAuthError, match=r"HTTP 403\): Access Denied"):
+            await client.login()
+        await client.aclose()
+
+        text = journal.path_for().read_text(encoding="utf-8")
+        assert "Access Denied" in text
+
+    async def test_a_non_json_body_on_a_read_is_a_plain_error(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(403, text="<html>Request rejected</html>")
+
+        client = _client(handler)
+        with pytest.raises(SmartApiError) as exc_info:
+            await client.order_book()
+        await client.aclose()
+        assert "Request rejected" in str(exc_info.value)
+        # A read cannot leave the broker in an unknown state — no escalation needed.
+        assert not isinstance(exc_info.value, UnknownOrderOutcomeError)
+
+    async def test_an_empty_non_json_body_is_reported_safely(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(403, text="")
+
+        client = _client(handler)
+        with pytest.raises(SmartApiError, match="<empty body>"):
+            await client.order_book()
+        await client.aclose()
+
+    # ── session token cache + login rate-limit backoff ───────────────────────
+
+    async def test_login_adopts_todays_cache_without_touching_the_network(self) -> None:
+        token_cache.save_session_cache(
+            api_key="key",
+            client_code="ABC123",
+            jwt_token="cached-jwt",
+            refresh_token="cached-refresh",
+            feed_token="cached-feed",
+            clock=_clock(),  # the client's own clock decides what "today" means
+        )
+        settings = _settings(
+            smartapi_client_code="ABC123",
+            smartapi_password="1234",
+            smartapi_totp_secret="JBSWY3DPEHPK3PXP",
+            smartapi_api_key="key",
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise AssertionError("a cached session must not hit the network")
+
+        client = _client(handler, settings=settings)
+        session = await client.login()
+        assert session.jwt_token == "cached-jwt"
+        assert session.feed_token == "cached-feed"
+        assert client.is_authenticated
+        await client.aclose()
+
+    async def test_login_saves_the_cache_for_the_next_start(self) -> None:
+        settings = _settings(
+            smartapi_client_code="ABC123",
+            smartapi_password="1234",
+            smartapi_totp_secret="JBSWY3DPEHPK3PXP",
+            smartapi_api_key="key",
+        )
+        client = _client(
+            lambda request: _ok(
+                {"jwtToken": "jwt", "refreshToken": "refresh", "feedToken": "feed"}
+            ),
+            settings=settings,
+        )
+        assert token_cache.load_session_cache("key", "ABC123", clock=_clock()) is None
+        await client.login()
+        await client.aclose()
+
+        saved = token_cache.load_session_cache("key", "ABC123", clock=_clock())
+        assert saved is not None  # the next start adopts this instead of logging in
+        assert saved.jwt_token == "jwt"
+        assert saved.feed_token == "feed"
+
+    async def test_a_stale_cache_falls_back_to_a_real_login(self) -> None:
+        yesterday = ManualClock(wall=datetime(2026, 8, 9, 15, 30, tzinfo=IST), mono=900.0)
+        token_cache.save_session_cache(
+            api_key="key",
+            client_code="ABC123",
+            jwt_token="stale-jwt",
+            refresh_token="stale-refresh",
+            feed_token="stale-feed",
+            clock=yesterday,
+        )
+        settings = _settings(
+            smartapi_client_code="ABC123",
+            smartapi_password="1234",
+            smartapi_totp_secret="JBSWY3DPEHPK3PXP",
+            smartapi_api_key="key",
+        )
+        calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            return _ok({"jwtToken": "fresh-jwt", "refreshToken": "r", "feedToken": "fresh-feed"})
+
+        client = _client(handler, settings=settings)
+        session = await client.login()
+        assert session.jwt_token == "fresh-jwt"
+        assert calls == 1
+        await client.aclose()
+
+    async def test_login_backs_off_on_the_rate_limit_then_succeeds(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(token_cache, "LOGIN_RATE_LIMIT_BACKOFFS", (0.0, 0.0))
+        settings = _settings(
+            smartapi_client_code="ABC123",
+            smartapi_password="1234",
+            smartapi_totp_secret="JBSWY3DPEHPK3PXP",
+            smartapi_api_key="key",
+        )
+        calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            if calls < 3:
+                return httpx.Response(
+                    403,
+                    json={
+                        "status": False,
+                        "message": "Access denied because of exceeding access rate",
+                        "errorcode": "AB1016",
+                    },
+                )
+            return _ok({"jwtToken": "jwt", "refreshToken": "r", "feedToken": "feed"})
+
+        client = _client(handler, settings=settings)
+        session = await client.login()
+        assert session.jwt_token == "jwt"
+        assert calls == 3  # two rate-limited refusals, then success
+        assert client.stats.rate_limit_waits == 2
+        await client.aclose()
+
+    async def test_login_does_not_retry_a_genuine_rejection(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Wrong credentials must surface at once — retrying them burns the attempt budget."""
+        monkeypatch.setattr(token_cache, "LOGIN_RATE_LIMIT_BACKOFFS", (0.0, 0.0))
+        settings = _settings(
+            smartapi_client_code="ABC123",
+            smartapi_password="wrong",
+            smartapi_totp_secret="JBSWY3DPEHPK3PXP",
+            smartapi_api_key="key",
+        )
+        calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            return httpx.Response(
+                200, json={"status": False, "message": "Invalid password", "errorcode": "AB1010"}
+            )
+
+        client = _client(handler, settings=settings)
+        with pytest.raises(SmartApiAuthError, match="Invalid password"):
+            await client.login()
+        assert calls == 1
+        await client.aclose()
+
+    async def test_login_gives_up_after_the_backoff_schedule(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(token_cache, "LOGIN_RATE_LIMIT_BACKOFFS", (0.0,))
+        settings = _settings(
+            smartapi_client_code="ABC123",
+            smartapi_password="1234",
+            smartapi_totp_secret="JBSWY3DPEHPK3PXP",
+            smartapi_api_key="key",
+        )
+        calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            return httpx.Response(
+                403,
+                json={
+                    "status": False,
+                    "message": "Access denied because of exceeding access rate",
+                    "errorcode": "AB1016",
+                },
+            )
+
+        client = _client(handler, settings=settings)
+        with pytest.raises(SmartApiAuthError, match="exceeding access rate"):
+            await client.login()
+        assert calls == 2  # one attempt plus one retry, then the schedule is exhausted
+        await client.aclose()
+
+    async def test_a_bare_http_401_counts_as_token_expired(self) -> None:
+        """A 401 with an undocumented error code still refreshes — the status is the signal."""
+        paths: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            paths.append(request.url.path)
+            if request.url.path == ORDER_BOOK.path and paths.count(ORDER_BOOK.path) == 1:
+                return httpx.Response(
+                    401, json={"status": False, "message": "Unauthorized", "errorcode": "XX9999"}
+                )
+            if request.url.path.endswith("generateTokens"):
+                return _ok({"jwtToken": "new-jwt", "feedToken": "f"})
+            return _ok([])
+
+        client = _client(handler)
+        client.session.refresh_token = "refresh-value"
+        assert await client.order_book() == ()
+        assert client.stats.token_refreshes == 1
+        await client.aclose()
+
+    async def test_a_dead_refresh_token_triggers_a_full_relogin(self) -> None:
+        """Cached session 401s, refresh is refused → invalidate cache, full login, replay."""
+        token_cache.save_session_cache(
+            api_key="key",
+            client_code="ABC123",
+            jwt_token="cached-jwt",
+            refresh_token="cached-refresh",
+            feed_token="cached-feed",
+            clock=_clock(),
+        )
+        settings = _settings(
+            smartapi_client_code="ABC123",
+            smartapi_password="1234",
+            smartapi_totp_secret="JBSWY3DPEHPK3PXP",
+            smartapi_api_key="key",
+        )
+        paths: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            paths.append(request.url.path)
+            if request.url.path == ORDER_BOOK.path and paths.count(ORDER_BOOK.path) == 1:
+                return httpx.Response(
+                    401, json={"status": False, "message": "Token expired", "errorcode": "AG8001"}
+                )
+            if request.url.path.endswith("generateTokens"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "status": False,
+                        "message": "Invalid refresh token",
+                        "errorcode": "AB1234",
+                    },
+                )
+            if request.url.path == LOGIN.path:
+                return _ok({"jwtToken": "fresh-jwt", "refreshToken": "r", "feedToken": "fresh"})
+            return _ok([])
+
+        client = _client(handler, settings=settings)
+        await client.login()  # adopts the cache — no network yet
+        assert paths == []
+
+        assert await client.order_book() == ()
+        assert LOGIN.path in paths  # the dead refresh forced a full re-login
+        assert client.session.jwt_token == "fresh-jwt"
+        assert client.stats.token_refreshes == 0
+        await client.aclose()
+
+    async def test_logout_invalidates_the_cache(self) -> None:
+        settings = _settings(
+            smartapi_client_code="ABC123",
+            smartapi_password="1234",
+            smartapi_totp_secret="JBSWY3DPEHPK3PXP",
+            smartapi_api_key="key",
+        )
+        client = _client(
+            lambda request: _ok({"jwtToken": "jwt", "refreshToken": "r", "feedToken": "feed"}),
+            settings=settings,
+        )
+        await client.login()
+        assert token_cache.load_session_cache("key", "ABC123", clock=_clock()) is not None
+
+        await client.logout()
+        assert token_cache.load_session_cache("key", "ABC123", clock=_clock()) is None
+        await client.aclose()
+
     async def test_secrets_never_reach_the_journal(self, journal: OrderJournal) -> None:
         settings = _settings(
             smartapi_client_code="ABC123",
@@ -1185,6 +1579,7 @@ class _Stack:
             settings=self.settings,
             mode=mode,
             clock=self.clock,
+            pnl=self.pnl,
         )
 
     async def aclose(self) -> None:
@@ -1753,3 +2148,314 @@ class TestOpenBracket:
 
         empty = ExecutionReport(symbol="RELIANCE", side=Side.BUY, at_ist="now", plan=None)
         assert OpenBracket.from_report(empty) is None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# P&L booking — the "+Rs.0.00" square-off fix
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestPnlBooking:
+    def test_bracket_entry_records_levels_and_direction(self, tmp_path: Path) -> None:
+        stack = _Stack(tmp_path, lambda request: _ok({}))
+        plan = stack.builder.build(
+            symbol="RELIANCE",
+            side=Side.BUY,
+            entry_price=Decimal("2500"),
+            atr=Decimal("8.40"),
+            headroom=Decimal("500"),
+        )
+        stack.executor._record_bracket_entry(plan)  # noqa: SLF001
+
+        record = stack.positions.get("RELIANCE")
+        assert record is not None
+        assert record.direction == "LONG"
+        assert record.entry_price == plan.legs[0].entry_price
+        assert record.stop_loss == plan.legs[0].stop_loss_price
+        assert record.target == plan.legs[0].target_price
+
+    def test_short_entry_inverts_direction(self, tmp_path: Path) -> None:
+        stack = _Stack(tmp_path, lambda request: _ok({}))
+        plan = stack.builder.build(
+            symbol="RELIANCE",
+            side=Side.SELL,
+            entry_price=Decimal("890.70"),
+            atr=Decimal("4.15"),
+            headroom=Decimal("500"),
+        )
+        stack.executor._record_bracket_entry(plan)  # noqa: SLF001
+        record = stack.positions.get("RELIANCE")
+        assert record is not None and record.direction == "SHORT"
+
+    def test_on_fill_books_long_pnl_from_broker_strings(self, tmp_path: Path) -> None:
+        """Broker fills arrive as JSON strings — they must book exactly."""
+        stack = _Stack(tmp_path, lambda request: _ok({}))
+        stack.positions.record_entry(
+            "RELIANCE",
+            quantity=10,
+            entry_price="100.00",
+            direction="LONG",
+        )
+        booked = stack.executor.on_fill("RELIANCE", "105.00", 10, charges="5")
+
+        assert booked
+        assert stack.pnl.realised == Decimal("50")  # (105-100)*10, gross
+        assert stack.pnl.total == Decimal("45")  # gross − ₹5 charges
+        assert not stack.positions.is_open("RELIANCE")
+
+    def test_on_fill_books_short_pnl_inverted(self, tmp_path: Path) -> None:
+        stack = _Stack(tmp_path, lambda request: _ok({}))
+        stack.positions.record_entry(
+            "RELIANCE",
+            quantity=10,
+            entry_price="100.00",
+            direction="SHORT",
+        )
+        booked = stack.executor.on_fill("RELIANCE", "90.00", 10)
+
+        assert booked
+        assert stack.pnl.realised == Decimal("100")  # (100-90)*10 for a short
+
+    def test_unparseable_fill_price_is_rejected_not_zeroed(self, tmp_path: Path) -> None:
+        stack = _Stack(tmp_path, lambda request: _ok({}))
+        stack.positions.record_entry("RELIANCE", 10, entry_price="100")
+        realised_before = stack.pnl.realised
+
+        assert stack.executor.on_fill("RELIANCE", "N/A", 5) is False
+        assert stack.pnl.realised == realised_before, "a bad price must never book ₹0.00"
+
+    def test_unknown_symbol_returns_false(self, tmp_path: Path) -> None:
+        stack = _Stack(tmp_path, lambda request: _ok({}))
+        assert stack.executor.on_fill("UNKNOWN", "100", 1) is False
+
+    def test_missing_tracker_is_critical_not_silent(self, tmp_path: Path) -> None:
+        stack = _Stack(tmp_path, lambda request: _ok({}))
+        executor_no_pnl = RoboExecutor(
+            client=stack.client,
+            builder=stack.builder,
+            risk=stack.risk,
+            positions=stack.positions,
+            journal=stack.journal,
+            settings=stack.settings,
+            mode=TradingMode.LIVE,
+            clock=stack.clock,
+            pnl=None,
+        )
+        stack.positions.record_entry("RELIANCE", 5, entry_price="100")
+        assert executor_no_pnl.on_fill("RELIANCE", "101", 5) is False
+
+    async def test_square_off_books_pnl_from_position_row_ltp(self, tmp_path: Path) -> None:
+        """The 15:15 path: exit accepted → P&L booked from the broker row's own LTP."""
+        from tachyon.execution.api import BrokerPosition
+
+        submitted: list[dict[str, str]] = []
+        stack = _Stack(
+            tmp_path,
+            lambda request: (_ok({"orderid": "exit-1"}), submitted.append(request))[0],
+        )
+        stack.positions.record_entry(
+            "RELIANCE",
+            quantity=10,
+            entry_price="890.70",
+            direction="SHORT",
+            stop_loss="894.85",
+            target="875.00",
+        )
+
+        position = BrokerPosition(
+            trading_symbol="RELIANCE-EQ",
+            token="738561",
+            exchange="NSE",
+            net_quantity=-10,
+            product_type="BO",
+            raw={"ltp": "920.35"},
+        )
+        executor = _StubBrokerQueries(
+            client=stack.client,
+            builder=stack.builder,
+            risk=stack.risk,
+            positions=stack.positions,
+            journal=stack.journal,
+            settings=stack.settings,
+            mode=TradingMode.LIVE,
+            clock=stack.clock,
+            pnl=stack.pnl,
+            open_positions=[position],
+            working_orders=[],
+        )
+
+        report = await executor.flatten_everything()
+        assert report.exits_submitted == 1
+        assert len(submitted) == 1
+
+        # SHORT from 890.70 exited at 920.35 → −29.65 × 10.
+        assert stack.pnl.realised == Decimal("-296.50"), (
+            "square-off P&L must be booked from the best known price"
+        )
+
+    async def test_square_off_without_any_price_defers_instead_of_booking_zero(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from tachyon.execution.api import BrokerPosition
+
+        stack = _Stack(tmp_path, lambda request: _ok({"orderid": "exit-1"}))
+        stack.positions.record_entry(
+            "RELIANCE", quantity=10, entry_price="890.70", direction="SHORT"
+        )
+        position = BrokerPosition(
+            trading_symbol="RELIANCE-EQ",
+            token="738561",
+            exchange="NSE",
+            net_quantity=-10,
+            product_type="BO",
+            raw={},
+        )
+        executor = _StubBrokerQueries(
+            client=stack.client,
+            builder=stack.builder,
+            risk=stack.risk,
+            positions=stack.positions,
+            journal=stack.journal,
+            settings=stack.settings,
+            mode=TradingMode.LIVE,
+            clock=stack.clock,
+            pnl=stack.pnl,
+            open_positions=[position],
+            working_orders=[],
+        )
+
+        realised_before = stack.pnl.realised
+        await executor.flatten_everything()
+        assert stack.pnl.realised == realised_before, (
+            "no price ⇒ no booking; silence was the ₹0.00 bug"
+        )
+
+
+class _StubBrokerQueries(RoboExecutor):
+    """Overrides the two broker queries square-off depends on (slots-safe)."""
+
+    def __init__(
+        self,
+        *,
+        open_positions: list[Any],
+        working_orders: list[Any],
+        **kwargs: Any,
+    ) -> None:
+        self._stub_positions = open_positions
+        self._stub_orders = working_orders
+        super().__init__(**kwargs)
+
+    async def _positions_open(self) -> tuple[BrokerPosition, ...]:
+        return tuple(self._stub_positions)
+
+    async def _orders(self) -> tuple[Any, ...]:
+        return tuple(self._stub_orders)
+
+
+async def _aret(value: object) -> object:
+    return value
+    return value
+
+
+class TestShmTopOfBookReader:
+    """The router's SHM book reader must unpack the full 56-byte slot.
+
+    Regression: ``_SLOT_STRUCT`` is ``<QQ8fI4x`` (timestamp, sequence, 8 floats,
+    flags). The reader originally unpacked that into four names, which raised
+    ``too many values to unpack (expected 4, got 11)`` the moment a matching slot
+    was found — silently denying every book lookup. This writes a tick through the
+    real :class:`~tachyon.ingestion.shm_writer.SHMWriter` and reads it back on a
+    private segment name, so the live ring is never touched.
+    """
+
+    @pytest.fixture()
+    def segment_name(self) -> Iterator[str]:
+        name = f"tachyon_test_book_{os.getpid()}"
+        yield name
+        if os.name == "posix":
+            with contextlib.suppress(FileNotFoundError):
+                (Path("/dev/shm") / name).unlink()
+
+    def test_reads_back_written_tick(self, segment_name: str) -> None:
+        from tachyon.execution.router import ShmTopOfBookReader
+        from tachyon.ingestion.shm_writer import SHMWriter
+
+        token = 12345
+        floats = (100.5, 40.0, 100.4, 15.0, 101.0, 25.0, 101.1, 9.0)
+        writer = SHMWriter(name=segment_name)
+        try:
+            writer.write_tick(token, 1_700_000_000_000_000_000, floats)
+        finally:
+            writer.close()
+
+        reader = ShmTopOfBookReader(name=segment_name)
+        try:
+            book = reader.read(token)
+        finally:
+            reader.close()
+
+        assert book is not None, "a fresh matching slot must produce a book"
+        assert book.bid == 100.5
+        assert book.bid_qty == 40.0
+        assert book.ask == 101.0
+        assert book.ask_qty == 25.0
+        assert book.usable
+
+    def test_unknown_token_returns_none(self, segment_name: str) -> None:
+        from tachyon.execution.router import ShmTopOfBookReader
+        from tachyon.ingestion.shm_writer import SHMWriter
+
+        writer = SHMWriter(name=segment_name)
+        try:
+            writer.write_tick(
+                777, 1_700_000_000_000_000_000, (1.0, 1.0, 0.9, 1.0, 1.1, 1.0, 1.2, 1.0)
+            )
+        finally:
+            writer.close()
+
+        reader = ShmTopOfBookReader(name=segment_name)
+        try:
+            assert reader.read(999) is None
+        finally:
+            reader.close()
+
+    def test_newest_slot_wins_across_multiple_writes(self, segment_name: str) -> None:
+        """Cells beyond the first must pass the seqlock integrity check.
+
+        Regression: the reader once required ``sequence == stamp - 1``, which only
+        holds for the very first slot of a fresh ring — every later cell was
+        silently rejected and book lookups returned ``None``. The stamp counts a
+        cell's writes (2 per completed write) while the payload sequence is the
+        global tail, so the invariant must derive the expected sequence from the
+        stamp and the cell index.
+        """
+        from tachyon.execution.router import ShmTopOfBookReader
+        from tachyon.ingestion.shm_writer import SHMWriter
+
+        token = 4242
+        writer = SHMWriter(name=segment_name)
+        try:
+            for i in range(1, 6):
+                other = 9999 if i % 2 else token
+                writer.write_tick(
+                    other,
+                    1_700_000_000_000_000_000 + i,
+                    (100.0 + i, 1.0, 100.0, 1.0, 101.0 + i, 2.0, 102.0, 1.0),
+                )
+            writer.write_tick(
+                token, 1_700_000_000_000_000_999, (200.0, 7.0, 199.0, 3.0, 201.0, 9.0, 202.0, 1.0)
+            )
+        finally:
+            writer.close()
+
+        reader = ShmTopOfBookReader(name=segment_name)
+        try:
+            book = reader.read(token)
+        finally:
+            reader.close()
+
+        assert book is not None, "cells after the first must satisfy the integrity check"
+        assert book.bid == 200.0, "the newest matching slot must win"
+        assert book.ask == 201.0
+        assert book.ask_qty == 9.0

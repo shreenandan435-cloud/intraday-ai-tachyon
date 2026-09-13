@@ -2,12 +2,12 @@
 
 from tachyon.alerts.telegram import (
     AlertType,
-    EntryAlert,
-    ExitAlert,
-    TrailAlert,
     DailySummaryAlert,
+    EntryAlert,
     ErrorAlert,
+    ExitAlert,
     TelegramAlerter,
+    TrailAlert,
     create_alerter_from_env,
     send_telegram_alert,
 )

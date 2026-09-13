@@ -12,7 +12,9 @@ reach the ZeroMQ spines at 5555/5556 or the real ``data/journal/``.
 from __future__ import annotations
 
 import importlib.util
+import os
 import socket
+import sys
 from collections.abc import Iterator
 from decimal import Decimal
 from pathlib import Path
@@ -229,3 +231,97 @@ class TestDailyLockGuard:
         path.write_text("this is not a lock file", encoding="utf-8")
 
         assert boot.guard_not_locked(DailyLock(path=path)) is not None
+
+
+# ─── Budget resolution chain (Vector 5) ──────────────────────────────────────
+
+
+class TestResolveBudget:
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        for var in ("TACHYON_BUDGET", "PAPER_TRADING_BUDGET_INR"):
+            monkeypatch.delenv(var, raising=False)
+
+    def test_cli_beats_everything(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("TACHYON_BUDGET", "111")
+        budget, source = boot.resolve_budget(_settings(), cli_raw="222222")
+        assert budget == Decimal("222222")
+        assert source == "--budget"
+
+    def test_tachyon_budget_alias_wins_over_legacy_env(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("TACHYON_BUDGET", "200000")
+        monkeypatch.setenv("PAPER_TRADING_BUDGET_INR", "300000")
+        budget, source = boot.resolve_budget(_settings())
+        assert budget == Decimal("200000") and source == "env:TACHYON_BUDGET"
+
+    def test_falls_through_an_unparseable_value_with_warning(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+
+        logs: list[dict[str, object]] = []
+
+        class _Log:
+            def warning(self, event: str, **kw: object) -> None:
+                logs.append({"event": event, **kw})
+
+        monkeypatch.setenv("TACHYON_BUDGET", "fifty-lakhs")
+        budget, source = boot.resolve_budget(_settings(), log=_Log())  # type: ignore[arg-type]
+        assert budget == Decimal("100000") and source == "default"
+        assert any(entry["event"] == "boot.budget_ignored" for entry in logs)
+
+    def test_yaml_setting_used_when_no_cli_or_env(self) -> None:
+        settings = _settings(capital=CapitalSettings(session_budget_inr=150000))
+        budget, source = boot.resolve_budget(settings)
+        assert budget == Decimal("150000") and source == "settings.yaml"
+
+
+# ─── Non-interactive handshake (Vector 5) ────────────────────────────────────
+
+
+class TestNonInteractiveHandshake:
+    def test_yes_flag_sets_both_handshake_vars(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class _FakeStdin:
+            @staticmethod
+            def isatty() -> bool:
+                return True
+
+        monkeypatch.setattr(sys, "stdin", _FakeStdin())
+        args = boot._parse_args(["--yes"])
+        boot._apply_non_interactive(args)
+        assert os.environ.get("TACHYON_ASSUME_YES") == "1"
+        assert os.environ.get("TACHYON_NON_INTERACTIVE") == "1"
+        os.environ.pop("TACHYON_ASSUME_YES", None)
+        os.environ.pop("TACHYON_NON_INTERACTIVE", None)
+
+    def test_headless_stdin_auto_engages_non_interactive(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class _NoStdin:
+            @staticmethod
+            def isatty() -> bool:
+                return False
+
+        monkeypatch.setattr(sys, "stdin", _NoStdin())
+        monkeypatch.delenv("TACHYON_ASSUME_YES", raising=False)
+        monkeypatch.delenv("TACHYON_NON_INTERACTIVE", raising=False)
+        args = boot._parse_args([])
+        engaged = boot._apply_non_interactive(args)
+        assert engaged
+        assert os.environ.get("TACHYON_NON_INTERACTIVE") == "1"
+        assert "TACHYON_ASSUME_YES" not in os.environ, "--yes absent ⇒ no auto-confirm"
+        os.environ.pop("TACHYON_NON_INTERACTIVE", None)
+
+    def test_interactive_tty_does_not_engage(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class _TtyStdin:
+            @staticmethod
+            def isatty() -> bool:
+                return True
+
+        monkeypatch.setattr(sys, "stdin", _TtyStdin())
+        monkeypatch.delenv("TACHYON_ASSUME_YES", raising=False)
+        monkeypatch.delenv("TACHYON_NON_INTERACTIVE", raising=False)
+        args = boot._parse_args([])
+        assert boot._apply_non_interactive(args) is False
+        assert "TACHYON_ASSUME_YES" not in os.environ

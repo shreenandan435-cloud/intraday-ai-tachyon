@@ -149,20 +149,27 @@ class TestCausalSelfAttention:
         assert kv_cache2.v.shape == (1, N_HEADS, 2, HEAD_DIM)
 
     def test_kv_cache_equivalence_to_full_window(self) -> None:
-        """Rolling single-step with KV cache should match full-window forward.
+        """Rolling single-step with KV cache MUST match full-window forward.
 
-        This test is marked as expected-to-fail due to known RoPE position handling
-        differences between full-window and step-by-step inference. In the full
-        forward, RoPE is applied to the entire sequence at once with absolute
-        positions. In step-by-step, the query for each new token uses position 0
-        of the RoPE tables, while cached keys have RoPE for their original positions.
-        This is a fundamental limitation of the current RoPE implementation for
-        autoregressive decoding and will be addressed in the inference export path.
+        This pins two invariants that export to TensorRT relies on:
+          1. RoPE position offsets: the query/key for step ``t`` are rotated at absolute
+             position ``t`` (cached keys are rotated once, at append time — never again).
+          2. ``is_causal=False`` on a single query against the full cache is equivalent
+             to the lower-triangular mask of the full-window pass.
         """
-        pytest.skip(
-            "Known limitation: RoPE position handling differs between "
-            "full-window and step-by-step inference. "
-            "Will be fixed in the TensorRT export path with explicit position offsets."
+        attn = _make_attention().eval()
+        torch.manual_seed(7)
+        xs = torch.randn(1, 8, D_MODEL)
+        with torch.no_grad():
+            full = attn(xs)
+            kv = None
+            stepped = []
+            for t in range(8):
+                out_t, kv = attn.step(xs[:, t : t + 1], kv)
+                stepped.append(out_t)
+            rolled = torch.cat(stepped, dim=1)
+        assert torch.allclose(full, rolled, atol=1e-5), (
+            f"step-vs-full divergence: {(full - rolled).abs().max().item()}"
         )
 
 
@@ -287,6 +294,29 @@ class TestCausalTransformer:
         for cache in kv_caches2:
             assert cache.k.shape == (1, N_HEADS, 2, HEAD_DIM)
             assert cache.v.shape == (1, N_HEADS, 2, HEAD_DIM)
+
+    def test_step_equivalence_to_full_window(self) -> None:
+        """Stack-level parity: N single-step decodes must equal the full-window pass.
+
+        This is the regression test for the bypassed-trunk bug — ``step()`` once applied the
+        final LayerNorm to the *input* ``x`` instead of the stack output ``hidden``, silently
+        returning ``LayerNorm(embedding)`` while the KV caches filled correctly. A per-layer
+        parity test cannot see that failure; only the end-to-end one can.
+        """
+        model = _make_transformer(n_layers=2).eval()
+        torch.manual_seed(11)
+        xs = torch.randn(1, 8, D_MODEL)
+        with torch.no_grad():
+            full = model(xs)
+            kv = None
+            stepped = []
+            for t in range(8):
+                out_t, kv = model.step(xs[:, t : t + 1], kv)
+                stepped.append(out_t)
+            rolled = torch.cat(stepped, dim=1)
+        assert torch.allclose(full, rolled, atol=1e-5), (
+            f"stack step-vs-full divergence: {(full - rolled).abs().max().item()}"
+        )
 
 
 # ─── GEGLU MLP ────────────────────────────────────────────────────────────────

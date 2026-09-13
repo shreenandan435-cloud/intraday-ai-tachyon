@@ -29,6 +29,9 @@ extend-exclude = ["*.md"]
 select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "SIM", "RET", "ARG", "PTH", "ASYNC", "T20"]
 # T20 bans print(); all output goes through structlog.
 # ASYNC catches blocking calls in async paths (CLAUDE.md §2.2).
+# boot_tachyon.py / generate_parquet.py are root-level operator entrypoints (same
+# category as main.py): the interactive budget prompt and the fixture-generator
+# banner must reach the operator's console before any logger exists.
 
 [tool.ruff.lint.per-file-ignores]
 # SIM300 misfires on `assert constants.X == time(15, 15)`, proposing the genuinely
@@ -42,6 +45,8 @@ select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "SIM", "RET", "ARG", "P
 # main.py is an entrypoint too. The LIVE confirmation banner must reach the operator's
 # terminal before they type; a structlog line to a file is not a prompt.
 "src/tachyon/main.py" = ["T20"]
+"boot_tachyon.py" = ["T20"]
+"generate_parquet.py" = ["T20"]
 
 # ── Types ──────────────────────────────────────────────────────────────
 [tool.mypy]
@@ -63,14 +68,37 @@ warn_required_dynamic_aliases = true
 # pyarrow ships no py.typed marker. It is confined to persistence.tick_recorder (the Track 1
 # sidecar) and never imported by the Ingestor or the Brain, so the untyped surface stays off
 # the trading path entirely.
-module = ["SmartApi.*", "logzero.*", "numba.*", "winloop.*", "uvloop.*", "pyarrow.*"]
+#
+# onnxruntime likewise ships no py.typed marker; it is confined to the ONNX fast path of
+# rl.rollout._load_model and its InferenceSession is held behind an Any-typed field.
+#
+# tensorrt is an optional accelerator-only wheel (absent on CPU-only dev boxes); rl.export
+# imports it lazily inside its Tier-1 build path and falls back to trtexec without it.
+#
+# aiohttp ships no py.typed marker. It is confined to ingestion.binance_vision_scraper —
+# the offline Binance Vision harvester — and never imported by the tick path.
+#
+# sdnotify is the Linux systemd notify protocol; it is never installed on Windows dev
+# boxes or the trading host, and core.shutdown imports it lazily behind an is_systemd()
+# guard (sys.platform check), so the untyped surface never executes outside systemd.
+#
+# pandas 3.x dropped its py.typed marker and pandas-stubs lags the 3.0 API. pandas is
+# confined to offline paths (data.dummy_generator, ingestion.binance_vision_scraper,
+# backtest reporting) — never the tick path (requirements.txt §Math Engine).
+module = ["SmartApi.*", "logzero.*", "numba.*", "winloop.*", "uvloop.*", "pyarrow.*", "onnxruntime.*", "tensorrt.*", "aiohttp.*", "pandas.*", "sdnotify.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 # @njit is an untyped decorator, so strict mode would reject every kernel. The signatures are
 # still declared and checked at the call sites; only the decorator itself is exempted.
-module = ["tachyon.math_engine.indicators"]
+# @jitclass (tachyon.math.vwap_filter) is untyped for the same reason, and numba's own
+# stubs do not re-export it from numba.experimental, so both error codes are silenced.
+module = ["tachyon.math.vwap_filter", "tachyon.math_engine.indicators"]
 disallow_untyped_decorators = false
+
+[[tool.mypy.overrides]]
+module = ["tachyon.math.vwap_filter"]
+disable_error_code = ["attr-defined", "no-untyped-call"]
 
 # ── Tests ──────────────────────────────────────────────────────────────
 [tool.pytest.ini_options]

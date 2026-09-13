@@ -38,6 +38,7 @@ never journaled (CLAUDE.md §5, §8).
 from __future__ import annotations
 
 import asyncio
+import random
 from dataclasses import dataclass, field
 from types import TracebackType
 from typing import Any, Final, Self
@@ -56,6 +57,10 @@ BASE_URL: Final[str] = "https://generativelanguage.googleapis.com"
 
 #: Path template for a single-turn generation call.
 GENERATE_PATH: Final[str] = "/v1beta/models/{model}:generateContent"
+
+#: Base delay before the single intra-call retry. Multiplied by a random factor in
+#: [0.5, 1.5) so concurrent Sentinels do not hammer the service in lockstep.
+RETRY_SLEEP_SECONDS: Final[float] = 0.5
 
 #: The model the Sentinel classifies with. Overridable via ``GEMINI_MODEL`` in ``.env``; this
 #: is the default that ``core.config`` uses, restated here because this is the module that
@@ -334,24 +339,43 @@ class GeminiClient:
         return self._parse_response(response, latency_ms, event)
 
     async def _post(self, payload: dict[str, Any]) -> httpx.Response:
-        """POST with one retry on a retryable status.
+        """POST with one jittered retry on a retryable status.
 
         Exactly one retry. Generation is idempotent in the only sense that matters — it places
         no orders and moves no money — so a retry is safe, but the Sentinel runs on a 15-minute
         cadence and there is no value in fighting a struggling service inside one cycle.
+
+        **Poller-death guard:** every exception that is not already a :class:`GeminiError`
+        is re-wrapped as :class:`GeminiUnavailableError` before escaping. The classifier
+        catches GeminiError subclasses and degrades; an exotic transport bug escaping raw
+        would instead kill the poller coroutine outright and latch the feed into
+        ``NEUTRAL (DEGRADED)`` permanently — the exact failure mode this guard prevents.
+        ``asyncio.CancelledError`` is a ``BaseException`` and passes through untouched, so
+        shutdown still works.
         """
         path = GENERATE_PATH.format(model=self._model)
         headers = {
             "Content-Type": "application/json",
             "x-goog-api-key": self._settings.gemini_api_key.get_secret_value(),
         }
-        body = _ENCODER.encode(payload)
+        try:
+            body = _ENCODER.encode(payload)
+        except Exception as exc:  # noqa: BLE001 - a malformed payload is our fault, not the wire's
+            raise GeminiRejectedError(f"request payload could not be encoded: {exc}") from exc
 
         for attempt in (0, 1):
             self.stats.requests += 1
-            response = await self._client.post(
-                path, content=body, headers=headers, timeout=self._timeout
-            )
+            try:
+                response = await self._client.post(
+                    path, content=body, headers=headers, timeout=self._timeout
+                )
+            except httpx.HTTPError:
+                raise  # generate() maps this to GeminiUnavailableError with full context
+            except Exception as exc:  # noqa: BLE001 - see the poller-death guard above
+                raise GeminiUnavailableError(
+                    f"Gemini transport failed unexpectedly: {type(exc).__name__}: {exc}"
+                ) from exc
+
             if response.status_code not in _RETRYABLE_STATUSES:
                 return response
             if attempt == 0:
@@ -361,7 +385,7 @@ class GeminiClient:
                     status=response.status_code,
                     model=self._model,
                 )
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(RETRY_SLEEP_SECONDS * random.uniform(0.5, 1.5))
         return response
 
     def _parse_response(
@@ -453,5 +477,5 @@ def _extract_text(envelope: dict[str, Any]) -> str | None:
 def _int_or_zero(payload: dict[str, Any], key: str) -> int:
     try:
         return int(payload.get(key, 0) or 0)
-    except TypeError, ValueError:
+    except (TypeError, ValueError):
         return 0

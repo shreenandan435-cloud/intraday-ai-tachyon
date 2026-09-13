@@ -167,14 +167,24 @@ class RotaryPositionalEmbedding(nn.Module):
         self.sin_table = self.sin_table.float()
         return self
 
-    def forward(self, x: Tensor) -> Tensor:
-        """Rotate ``x``. Last dimension must be ``dim``; second-to-last is the time axis."""
+    def forward(self, x: Tensor, offset: int = 0) -> Tensor:
+        """Rotate ``x``. Last dimension must be ``dim``; second-to-last is the time axis.
+
+        ``offset`` is the absolute position of the token at index 0 of the time axis: 0 for a
+        full window, ``T_past`` for a KV-cached single-step decode. Without it a cached rollout
+        would rotate every new query as if it were at position 0, and — worse — re-rotate cached
+        keys that were already rotated when they entered the cache; the two errors compound into
+        a key from step ``j`` being read at rotation ``R_{(t-j)j}`` instead of ``R_j``.
+        """
         seq_len = x.size(-2)
-        cos = self.cos_table[:seq_len]
-        sin = self.sin_table[:seq_len]
+        cos = self.cos_table[offset : offset + seq_len]
+        sin = self.sin_table[offset : offset + seq_len]
         # fp32 throughout the rotation, then back — see the module docstring on why fp16 cos/sin
-        # quantises adjacent positions together.
-        rotated = x.float() * cos + _rotate_half(x.float()) * sin
+        # quantises adjacent positions together. Up-cast ONCE and reuse: the rotation is applied
+        # to Q and K in every layer, so a double ``x.float()`` was allocating two fp32 copies of
+        # the activation per application (~200 MB of redundant traffic per training batch).
+        xf = x.float()
+        rotated = xf * cos + _rotate_half(xf) * sin
         return rotated.to(x.dtype)
 
     def extra_repr(self) -> str:

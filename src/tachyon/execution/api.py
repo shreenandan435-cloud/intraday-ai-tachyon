@@ -46,6 +46,7 @@ never logged, never journaled, never published over IPC (CLAUDE.md §5, §8).
 from __future__ import annotations
 
 import asyncio
+import re
 import socket
 import uuid
 from dataclasses import dataclass, field
@@ -57,6 +58,7 @@ from typing import Any, Final, Self
 import httpx
 import pyotp
 
+from tachyon.core import token_cache
 from tachyon.core.clock import SYSTEM_CLOCK, Clock, now_ist
 from tachyon.core.config import Settings, get_settings
 from tachyon.core.constants import TradingMode
@@ -105,6 +107,37 @@ PAPER_INTERCEPTED: Final[frozenset[str]] = frozenset(
 #: Prefix on every simulated order id. Angel One order ids are numeric strings, so this can
 #: never collide with a real one — in a log line, in the journal, or in the order book.
 PAPER_ORDER_PREFIX: Final[str] = "PAPER-"
+
+#: Longest slice of a non-JSON error page allowed to reach a log line or the journal. WAF
+#: interstitials are mostly markup; the rejection reason lives in the first few words.
+_NON_JSON_SNIPPET_LIMIT: Final[int] = 300
+
+
+def _normalize_totp_secret(secret: str) -> str:
+    """Canonicalise a pasted TOTP secret before handing it to ``pyotp``.
+
+    pyotp 2.10 restores missing ``=`` padding itself and casefolds on decode, but a secret
+    pasted from an authenticator-app export with embedded whitespace still fails
+    ``base64.b32decode`` ("Non-base32 digit found") — at login time, the worst moment to
+    discover it. Strip whitespace, upper-case and pad explicitly so the decode cannot fail
+    for formatting reasons.
+    """
+    cleaned = "".join(secret.upper().split())
+    return cleaned + "=" * (-len(cleaned) % 8)
+
+
+def _summarize_non_json_body(text: str) -> str:
+    """Reduce a WAF/gateway error page to one log-safe line.
+
+    Angel One's edge firewall answers blocked requests with an HTML interstitial rather
+    than JSON. Stripping tags and collapsing whitespace surfaces the actual rejection
+    ("Access Denied", "Request rejected") instead of a wall of markup, and the truncation
+    keeps a full-page block from flooding the journal.
+    """
+    cleaned = " ".join(re.sub(r"<[^>]+>", " ", text).split())
+    if len(cleaned) > _NON_JSON_SNIPPET_LIMIT:
+        cleaned = cleaned[:_NON_JSON_SNIPPET_LIMIT] + "..."
+    return cleaned or "<empty body>"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -365,13 +398,30 @@ class ApiStats:
     last_error: str | None = None
 
 
+#: Static egress IP for the Giganode SSH tunnel. Angel One's WAF whitelists this
+#: address; reporting the LAN IP in ``X-ClientPublicIP`` produces an HTTP 401/403
+#: rejection (CLAUDE.md §6). Override via ``ANGEL_PUBLIC_IP`` for a different tunnel.
+_GIGANODE_PUBLIC_IP: Final[str] = "87.76.191.175"
+
+
 @dataclass(frozen=True, slots=True)
 class ClientIdentity:
-    """The ``X-Client*`` headers SmartAPI requires on every authenticated call.
+    """The ``X-Client*`` headers SmartAPI requires on every call.
 
-    Best-effort values. The broker requires the headers to be present and well-formed; it does
-    not verify that the addresses are reachable. Resolved once at construction so nothing on
-    the async path performs a blocking DNS lookup.
+    ``public_ip`` is the **egress** IP, not the local LAN address: Angel One's WAF
+    whitelists a single static address (the Giganode tunnel endpoint at
+    :data:`_GIGANODE_PUBLIC_IP`) and rejects every other source with HTTP 401/403.
+    ``local_ip`` stays as the LAN address — it is informational, not whitelisted.
+
+    The ``X-ClientPublicIP`` value is read from the ``ANGEL_PUBLIC_IP`` env var when set
+    (so a non-Giganode tunnel can be wired without a code change), then from the constant,
+    then — only if both are unavailable — falls back to the LAN address with a warning.
+    Loopback must never be reported: Angel One's WAF rejects ``127.0.0.1`` in
+    ``X-ClientLocalIP``/``X-ClientPublicIP`` with an HTTP 403 before the request reaches
+    the API, so :meth:`detect` falls back to a standard dummy LAN address instead.
+
+    Resolved once at construction so nothing on the async path performs a blocking DNS
+    lookup or env lookup.
     """
 
     local_ip: str
@@ -380,13 +430,60 @@ class ClientIdentity:
 
     @classmethod
     def detect(cls) -> Self:
-        try:
-            local = socket.gethostbyname(socket.gethostname())
-        except OSError:
-            local = "127.0.0.1"
+        local = cls._outbound_ip()
+        public = cls._public_ip(local)
         node = uuid.getnode()
         mac = ":".join(f"{(node >> shift) & 0xFF:02X}" for shift in range(40, -1, -8))
-        return cls(local_ip=local, public_ip=local, mac_address=mac)
+        return cls(local_ip=local, public_ip=public, mac_address=mac)
+
+    @staticmethod
+    def _public_ip(fallback: str) -> str:
+        """Resolve the static egress IP that the broker WAF whitelists.
+
+        Order of precedence:
+
+        1. ``ANGEL_PUBLIC_IP`` env var — explicit override (lets a non-Giganode tunnel
+           be wired without a code change; ``angel_adapter.fetch_historical_candles``
+           reads the same constant, so both REST and WebSocket egress match).
+        2. :data:`_GIGANODE_PUBLIC_IP` — the Giganode tunnel endpoint. Hard-coded so a
+           blank environment (a launcher that forgot to set the var) still reports the
+           correct egress IP. Reporting the LAN IP here is the failure mode that
+           produces the HTTP 401/403 from the broker.
+        3. The detected LAN address, with a warning — only reached when the constant
+           is somehow empty, which is a configuration error worth surfacing.
+        """
+        import os
+
+        override = os.environ.get("ANGEL_PUBLIC_IP", "").strip()
+        if override:
+            return override
+        if _GIGANODE_PUBLIC_IP:
+            return _GIGANODE_PUBLIC_IP
+        _log.warning(
+            "execution.public_ip_fallback — ANGEL_PUBLIC_IP unset and the Giganode constant "
+            "is empty; reporting the LAN address %s; Angel One will reject every call with "
+            "HTTP 401/403 until the static IP is configured",
+            fallback,
+        )
+        return fallback
+
+    @staticmethod
+    def _outbound_ip() -> str:
+        """The LAN address the OS would route outbound traffic from.
+
+        A UDP ``connect`` sends no packets — it only selects the egress interface — so this
+        is a cheap one-shot lookup, safe to run once at construction.
+        """
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+                probe.settimeout(1.0)
+                probe.connect(("203.0.113.1", 80))  # TEST-NET-3: unroutable, nothing is sent
+                candidate = str(probe.getsockname()[0])
+            if candidate and not candidate.startswith("127."):
+                return candidate
+        except OSError:
+            pass
+        return "192.168.1.1"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -536,7 +633,7 @@ class SmartApiClient:
         Raises:
             SmartApiAuthError: no TOTP secret is configured, or it is not valid base32.
         """
-        secret = self._settings.smartapi_totp_secret.get_secret_value().strip()
+        secret = _normalize_totp_secret(self._settings.smartapi_totp_secret.get_secret_value())
         if not secret:
             raise SmartApiAuthError(LOGIN.name, "SMARTAPI_TOTP_SECRET is not set")
         try:
@@ -552,27 +649,47 @@ class SmartApiClient:
         which the ingestion process needs for its WebSocket handshake, and which is the reason
         ``SMARTAPI_FEED_TOKEN`` no longer has to be pasted into ``.env`` by hand.
 
+        Session cache
+        -------------
+        A same-day session cached on disk is adopted **without touching the network**: Angel
+        One rate-limits ``loginByPassword`` hard, and every supervisor restart used to fire a
+        fresh login. Only a missing, stale or 401-rejected cache re-authenticates — the 401
+        path is handled in :meth:`_call`, which invalidates the cache and re-enters here.
+
         Raises:
             SmartApiAuthError: credentials missing, or the broker rejected them.
         """
         client_code = self._settings.smartapi_client_code.get_secret_value().strip()
         password = self._settings.smartapi_password.get_secret_value().strip()
+        api_key = self._settings.smartapi_api_key.get_secret_value().strip()
+
+        cached = (
+            token_cache.load_session_cache(api_key, client_code, clock=self._clock)
+            if client_code
+            else None
+        )
+        if cached is not None:
+            self.session = BrokerSession(
+                jwt_token=cached.jwt_token,
+                refresh_token=cached.refresh_token,
+                feed_token=cached.feed_token,
+                client_code=cached.client_code,
+                issued_at_ist=cached.issued_at_ist,
+            )
+            _log.info("broker.login_from_cache", client_code=client_code, mode=self._mode)
+            return self.session
+
         if not client_code or not password:
             raise SmartApiAuthError(
                 LOGIN.name,
                 "SMARTAPI_CLIENT_CODE and SMARTAPI_PASSWORD are both required to log in",
             )
 
-        payload = {
-            "clientcode": client_code,
-            "password": password,
-            "totp": self.current_totp(),
-        }
         # The journal records that a login was attempted; scrub_secrets removes the
         # password and totp values before anything reaches the disk.
         self._journal.request(LOGIN.name, {"clientcode": client_code})
 
-        data = await self._call(LOGIN, json=payload, authenticated=False)
+        data = await self._login_with_backoff(client_code, password)
         tokens = data if isinstance(data, dict) else {}
         jwt = str(tokens.get("jwtToken", "")).removeprefix("Bearer ").strip()
         feed = str(tokens.get("feedToken", "")).strip()
@@ -588,8 +705,54 @@ class SmartApiClient:
             client_code=client_code,
             issued_at_ist=now_ist(self._clock),
         )
+        token_cache.save_session_cache(
+            api_key=api_key,
+            client_code=client_code,
+            jwt_token=jwt,
+            refresh_token=self.session.refresh_token,
+            feed_token=feed,
+            clock=self._clock,
+        )
         _log.info("broker.login_ok", client_code=client_code, mode=self._mode)
         return self.session
+
+    async def _login_with_backoff(self, client_code: str, password: str) -> Any:
+        """``loginByPassword`` with exponential backoff on the login rate limit.
+
+        Angel One answers a login burst with HTTP 403 "Access denied because of exceeding
+        access rate". Retrying immediately re-arms the ban — a supervisor restart loop can
+        turn one ban into a day-long lockout — so each retry waits on an exponential
+        schedule instead of killing the process. Any *other* refusal (wrong password, bad
+        TOTP) propagates at once: retrying bad credentials burns the account's attempt
+        budget and can lock the account.
+        """
+        attempt = 0
+        while True:
+            # Rebuilt per attempt: a 30-120 s sleep crosses TOTP windows.
+            payload = {
+                "clientcode": client_code,
+                "password": password,
+                "totp": self.current_totp(),
+            }
+            try:
+                return await self._call(
+                    LOGIN, json=payload, authenticated=False, allow_refresh=False
+                )
+            except SmartApiError as exc:
+                if attempt >= len(
+                    token_cache.LOGIN_RATE_LIMIT_BACKOFFS
+                ) or not token_cache.is_rate_limited_message(str(exc)):
+                    raise
+                delay = token_cache.LOGIN_RATE_LIMIT_BACKOFFS[attempt]
+                attempt += 1
+                self.stats.rate_limit_waits += 1
+                _log.warning(
+                    "broker.login_rate_limited",
+                    attempt=attempt,
+                    retry_in_seconds=delay,
+                    error=str(exc),
+                )
+                await asyncio.sleep(delay)
 
     async def refresh_session(self) -> BrokerSession:
         """Exchange the refresh token for a new JWT.
@@ -602,15 +765,22 @@ class SmartApiClient:
             if not self.session.refresh_token:
                 raise SmartApiAuthError(REFRESH.name, "no refresh token — a full login is needed")
 
-            data = await self._call(
-                REFRESH,
-                json={"refreshToken": self.session.refresh_token},
-                authenticated=True,
-                allow_refresh=False,
-            )
+            try:
+                data = await self._call(
+                    REFRESH,
+                    json={"refreshToken": self.session.refresh_token},
+                    authenticated=True,
+                    allow_refresh=False,
+                )
+            except SmartApiAuthError:
+                # The broker refused the refresh token itself — the cached session is dead
+                # server-side. Drop the cache so the next start re-authenticates cleanly.
+                token_cache.invalidate_session_cache()
+                raise
             tokens = data if isinstance(data, dict) else {}
             jwt = str(tokens.get("jwtToken", "")).removeprefix("Bearer ").strip()
             if not jwt:
+                token_cache.invalidate_session_cache()
                 raise SmartApiAuthError(REFRESH.name, "refresh returned no jwtToken")
 
             self.session.jwt_token = jwt
@@ -622,6 +792,14 @@ class SmartApiClient:
             )
             self.session.issued_at_ist = now_ist(self._clock)
             self.stats.token_refreshes += 1
+            token_cache.save_session_cache(
+                api_key=self._settings.smartapi_api_key.get_secret_value().strip(),
+                client_code=self.session.client_code,
+                jwt_token=self.session.jwt_token,
+                refresh_token=self.session.refresh_token,
+                feed_token=self.session.feed_token,
+                clock=self._clock,
+            )
             _log.info("broker.session_refreshed")
             return self.session
 
@@ -635,6 +813,8 @@ class SmartApiClient:
             _log.warning("broker.logout_failed", error=str(exc))
         finally:
             self.session.clear()
+            # The broker killed this session; a cached copy must not outlive it.
+            token_cache.invalidate_session_cache()
 
     # ── order operations ─────────────────────────────────────────────────────
 
@@ -883,19 +1063,28 @@ class SmartApiClient:
             try:
                 body = response.json()
             except ValueError as exc:
-                self._journal.error(
-                    endpoint.name,
-                    f"non-JSON response (HTTP {response.status_code})",
-                    order_tag=order_tag,
+                # WAF blocks and gateway errors arrive as HTML, not JSON. Extract the
+                # rejection text so the operator sees *why* the call was refused instead
+                # of a bare status code.
+                snippet = _summarize_non_json_body(response.text)
+                detail = f"non-JSON response (HTTP {response.status_code}): {snippet}"
+                _log.error(
+                    "broker.non_json_response",
+                    endpoint=endpoint.name,
+                    status_code=response.status_code,
+                    body=snippet,
                 )
+                self._journal.error(endpoint.name, detail, order_tag=order_tag)
+                if endpoint in (LOGIN, REFRESH):
+                    # A session request rejected at the edge has no unknown *order* outcome;
+                    # classify it as auth so the login backoff can inspect the refusal.
+                    raise SmartApiAuthError(endpoint.name, detail) from exc
                 if endpoint.idempotent:
-                    raise SmartApiError(
-                        endpoint.name, f"non-JSON response (HTTP {response.status_code})"
-                    ) from exc
+                    raise SmartApiError(endpoint.name, detail) from exc
                 self.stats.unknown_outcomes += 1
                 raise UnknownOrderOutcomeError(
                     endpoint.name,
-                    f"non-JSON response (HTTP {response.status_code})",
+                    detail,
                     order_tag=order_tag,
                 ) from exc
 
@@ -907,9 +1096,25 @@ class SmartApiClient:
                 _log.debug("broker.ok", endpoint=endpoint.name, latency_ms=round(latency_ms, 1))
                 return payload.get("data")
 
-            if error_code in _TOKEN_ERROR_CODES and allow_refresh and self.session.refresh_token:
-                _log.warning("broker.token_expired", endpoint=endpoint.name, error_code=error_code)
-                await self.refresh_session()
+            # "Token expired" arrives either as a documented error code or as a bare HTTP
+            # 401; both mean the same thing — the cached/refreshed JWT is no longer valid.
+            token_expired = error_code in _TOKEN_ERROR_CODES or response.status_code == 401
+            if token_expired and allow_refresh and self.session.refresh_token:
+                _log.warning(
+                    "broker.token_expired",
+                    endpoint=endpoint.name,
+                    error_code=error_code,
+                    http_status=response.status_code,
+                )
+                try:
+                    await self.refresh_session()
+                except SmartApiAuthError:
+                    # The refresh token is dead too — e.g. a cached session the broker
+                    # revoked. refresh_session already dropped the cache; one full
+                    # re-login, then the retried call below gets the fresh JWT.
+                    if endpoint in (LOGIN, REFRESH):
+                        raise
+                    await self.login()
                 allow_refresh = False
                 continue
 

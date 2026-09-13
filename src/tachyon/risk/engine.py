@@ -33,6 +33,10 @@ Order     Check                       Vetoes when
 10        ``SENTINEL_RISK_OFF``       macro regime is RISK_OFF, or the symbol is
                                       news-blacklisted (§5)
 11        ``INSUFFICIENT_MARGIN``     the broker reports too little free cash (§4)
+12        ``VWAP_OVEREXTENDED``       LONG entry with LTP > session VWAP by more than
+                                      ``strategy.max_vwap_extension_pct`` (default 1.5 %),
+                                      or more than +2σ above it in realised session
+                                      volatility (the volume-weighted z-score filter)
 ========  ==========================  ====================================================
 
 Cheapest and most fundamental first, so the common rejections cost almost nothing. The margin
@@ -49,7 +53,8 @@ the reason we cannot trade at all.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import math
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -61,8 +66,9 @@ from tachyon.core.config import Settings, get_settings
 from tachyon.core.logger import get_logger
 from tachyon.core.state import StateMachine, TradingState
 from tachyon.ipc.monitor import FeedMonitor
+from tachyon.math.vwap_filter import DEFAULT_Z_THRESHOLD, VWAPZScoreFilter, prewarm_vwap_filter
 from tachyon.math_engine.warmup import is_warm
-from tachyon.risk.tracker import PnLTracker, PositionRegistry
+from tachyon.risk.tracker import PnLTracker, PositionRegistry, evaluate_exits, to_decimal
 from tachyon.sentinel.state import MacroState
 
 _log = get_logger(__name__)
@@ -83,8 +89,43 @@ class VetoReason(StrEnum):
     SENTINEL_RISK_OFF = "SENTINEL_RISK_OFF"
     INSUFFICIENT_MARGIN = "INSUFFICIENT_MARGIN"
 
+    #: The overextension guardrail: price has run too far above session VWAP for a LONG.
+    #: Chasing a vertical breakout buys the top of the move; mean reversion collects the
+    #: position immediately after fill.
+    VWAP_OVEREXTENDED = "VWAP_OVEREXTENDED"
+
     #: A check itself raised. Always a veto — see the module docstring.
     CHECK_FAILED = "CHECK_FAILED"
+
+
+class ExitReason(StrEnum):
+    """Why an open position must be flattened immediately."""
+
+    STOP_LOSS_HIT = "STOP_LOSS_HIT"
+    TARGET_HIT = "TARGET_HIT"
+
+    #: The position's protective levels could not be evaluated against a usable price.
+    #: Treated as a mandatory exit: with an unknown mark we cannot prove the position is
+    #: safe, and for *exits* — unlike the Sentinel entry check — absence of information
+    #: is NOT permission to keep holding.
+    PRICE_UNUSABLE = "PRICE_UNUSABLE"
+
+
+@dataclass(frozen=True, slots=True)
+class ExitDecision:
+    """A forced-exit order may only be built from this."""
+
+    symbol: str
+    reason: ExitReason
+    direction: str
+    quantity: int
+    ltp: Decimal
+    threshold: Decimal
+    at_ist: datetime
+    action: str = "EXIT_MARKET_IMMEDIATE"
+
+    def __bool__(self) -> bool:
+        return True
 
 
 #: Checks required by CLAUDE.md §4 that later phases must supply. Empty as of Phase 9 — kept
@@ -95,6 +136,12 @@ PENDING_CHECKS: Final[tuple[str, ...]] = ()
 #: entry path and must not await a network call there, so the Brain refreshes a cached value
 #: on its own schedule and this returns the latest reading. ``None`` means "not wired".
 MarginProvider = Callable[[], Decimal]
+
+#: Supplies ``(ltp, session_vwap)`` for a symbol from in-memory indicator state — the same
+#: values the signal generator just used. Synchronous and cheap by contract: it reads dicts
+#: the Brain already holds, never the broker. Returning ``None`` means "no view of this
+#: symbol", which disables the overextension check for that evaluation rather than guessing.
+QuoteProvider = Callable[[str], tuple[float, float] | None]
 
 #: A check returns None to pass, or (reason, detail) to veto.
 CheckResult = tuple[VetoReason, str] | None
@@ -114,6 +161,19 @@ class RiskDecision:
 
     def __bool__(self) -> bool:
         return self.allowed
+
+
+@dataclass(slots=True)
+class _VWAPZFilter:
+    """One symbol's z-score accumulator plus the price of its most recent print.
+
+    The last price is what lets check 12 score an entry that arrives with no
+    quote of its own — Track 2's ExecutionRouter evaluates actions without a
+    signal-step VWAP pair, so the accumulator's freshest print stands in.
+    """
+
+    filter: VWAPZScoreFilter
+    last_price: float | None = None
 
 
 class RiskEngine:
@@ -143,9 +203,13 @@ class RiskEngine:
         "_margin_provider",
         "_pnl",
         "_positions",
+        "_quote_provider",
         "_settings",
         "_state_machine",
         "_vetoes",
+        "_vwap_filters",
+        "_vwap_z_ready",
+        "_vwap_z_threshold",
     )
 
     def __init__(
@@ -159,6 +223,8 @@ class RiskEngine:
         clock: Clock = SYSTEM_CLOCK,
         margin_provider: MarginProvider | None = None,
         macro_state: MacroState | None = None,
+        quote_provider: QuoteProvider | None = None,
+        vwap_z_threshold: float | None = None,
     ) -> None:
         self._state_machine = state_machine
         self._pnl = pnl
@@ -168,7 +234,17 @@ class RiskEngine:
         self._clock = clock
         self._margin_provider = margin_provider
         self._macro = macro_state
-        self._vetoes: dict[VetoReason, int] = {}
+        self._quote_provider = quote_provider
+        self._vetoes: dict[StrEnum, int] = {}
+
+        # ── the z-score overextension filter (check 12, volatility-aware clause) ──
+        # The jitclass compiles lazily on first call; prewarming here — boot time, never
+        # tick time — is what keeps a cold compile off the first live print (CLAUDE.md §3).
+        self._vwap_z_threshold = (
+            vwap_z_threshold if vwap_z_threshold is not None else DEFAULT_Z_THRESHOLD
+        )
+        self._vwap_z_ready = prewarm_vwap_filter()
+        self._vwap_filters: dict[str, _VWAPZFilter] = {}
 
     # ── public API ───────────────────────────────────────────────────────────
 
@@ -176,7 +252,190 @@ class RiskEngine:
         """True only if every check passes. Never raises."""
         return self.evaluate(symbol).allowed
 
-    def evaluate(self, symbol: str, *, required_margin: Decimal | None = None) -> RiskDecision:
+    def observe_tick(self, symbol: str, price: float, volume_delta: float) -> None:
+        """Fold one print into the symbol's session z-score accumulator. Never raises.
+
+        Called from the Brain's tick handler with the same differenced per-print volume the
+        aggregator just consumed (:attr:`TickAggregator.last_volume_delta`), so both views
+        of the session can never disagree about what was traded. The print's price is
+        retained so the gate can score a quote-less entry (Track 2's ExecutionRouter path)
+        against the freshest evidence it holds.
+
+        The verdict computed here is discarded: the gate scores the judged price itself at
+        decision time via :meth:`VWAPZScoreFilter.score`, which is pure — judging a price
+        must not fold it into the averages it is judged against.
+
+        Failure policy mirrors the gate itself: a non-finite price or volume is discarded
+        (a NaN would poison the running sums permanently), and a kernel that somehow raises
+        drops only *this symbol's* accumulator and logs — the feed, the other symbols and
+        the gate all keep running.
+        """
+        if not self._vwap_z_ready:
+            return
+
+        if not (math.isfinite(price) and math.isfinite(volume_delta)):
+            _log.debug(
+                "risk.vwap_z_tick_discarded",
+                symbol=symbol,
+                price=price,
+                volume_delta=volume_delta,
+                reason="non-finite input would poison the session sums",
+            )
+            return
+
+        try:
+            track = self._vwap_filters.get(symbol)
+            if track is None:
+                track = _VWAPZFilter(
+                    filter=VWAPZScoreFilter(self._vwap_z_threshold), last_price=price
+                )
+                self._vwap_filters[symbol] = track
+            else:
+                track.last_price = price
+
+            # The verdict computed here is discarded: the gate scores the judged price
+            # itself at decision time via score(), which is pure. Feeding never scores.
+            track.filter.process_tick(price, volume_delta)
+        except Exception as exc:  # noqa: BLE001 - fail-safe: drop the accumulator, not the gate
+            self._vwap_filters.pop(symbol, None)
+            _log.error(
+                "risk.vwap_z_feed_failed",
+                symbol=symbol,
+                error=str(exc),
+                error_type=type(exc).__name__,
+                action="z-score accumulator dropped for this symbol; percentage check remains",
+            )
+
+    def reset_vwap_session(self) -> None:
+        """Clear every z-score accumulator at 09:15 IST. VWAP is session-anchored (§3.1).
+
+        Fresh filters are built lazily on the first tick of the new session; the compiled
+        code is cached, so this allocates objects but never recompiles.
+        """
+        self._vwap_filters.clear()
+
+    def check_exits(
+        self, ltp_by_symbol: Mapping[str, Decimal | str | int | float]
+    ) -> tuple[ExitDecision, ...]:
+        """Per-tick protective-exit evaluation. Call this from the live tick path.
+
+        The 15:15 incident — a SHORT held through its Stop Loss all the way past ₹920
+        until auto-square-off — happened because SL/TP levels lived in the strategy loop,
+        which only compared them occasionally. This method is the fix's contract: feed it
+        the latest LTP for every open symbol on **every** tick and flatten whatever comes
+        back, immediately and by market order.
+
+        Direction-aware (SHORT inverts both comparisons), ``Decimal``-exact via
+        :func:`~tachyon.risk.tracker.to_decimal` — broker strings like ``"890.70"`` and
+        indicator floats are handled identically, which is what killed the zero-rupee
+        square-off P&L print.
+
+        Fail-safe inversion: a price that was provided but cannot be parsed yields an
+        exit decision with :attr:`ExitReason.PRICE_UNUSABLE` for that position. An
+        **absent** price means the symbol simply did not tick this instant — that is
+        covered by the feed-staleness guards, not by flattening. For entries, unknown
+        state vetoes; for exits, corrupt state forces flattening. Holding blind is the
+        one thing this engine must never do.
+        """
+        at = self._now()
+        records = self._positions.records_snapshot()
+
+        try:
+            signals = evaluate_exits(records, ltp_by_symbol)
+        except Exception as exc:  # noqa: BLE001 - fail-safe: flatten everything
+            _log.critical(
+                "risk.exit_evaluation_failed",
+                error=str(exc),
+                error_type=type(exc).__name__,
+                action="EXIT_MARKET_IMMEDIATE for all open positions (fail-safe)",
+                exc_info=True,
+            )
+            return tuple(
+                ExitDecision(
+                    symbol=symbol,
+                    reason=ExitReason.PRICE_UNUSABLE,
+                    direction=record.direction,
+                    quantity=record.quantity,
+                    ltp=Decimal("0"),
+                    threshold=Decimal("0"),
+                    at_ist=at,
+                )
+                for symbol, record in records.items()
+            )
+
+        decisions: list[ExitDecision] = []
+        signalled: set[str] = set()
+        for signal in signals:
+            signalled.add(signal.symbol)
+            self._vetoes[ExitReason(signal.reason)] = (
+                self._vetoes.get(ExitReason(signal.reason), 0) + 1
+            )
+            _log.warning(
+                "risk.exit_triggered",
+                symbol=signal.symbol,
+                reason=signal.reason,
+                direction=signal.direction,
+                quantity=signal.quantity,
+                ltp=str(signal.ltp),
+                threshold=str(signal.threshold),
+                action="flatten immediately",
+            )
+            decisions.append(
+                ExitDecision(
+                    symbol=signal.symbol,
+                    reason=ExitReason(signal.reason),
+                    direction=signal.direction,
+                    quantity=signal.quantity,
+                    ltp=signal.ltp,
+                    threshold=signal.threshold,
+                    at_ist=at,
+                )
+            )
+
+        # Fail-safe sweep: a provided-but-unparseable LTP on an open position gets a
+        # mandatory-exit decision rather than silence. An absent LTP means the symbol
+        # simply did not tick this instant and is deliberately not acted on here.
+        for symbol, record in records.items():
+            if symbol in signalled:
+                continue
+            raw_ltp = ltp_by_symbol.get(symbol)
+            if raw_ltp is None:
+                continue
+            try:
+                to_decimal(raw_ltp)
+            except ValueError:
+                self._vetoes[ExitReason.PRICE_UNUSABLE] = (
+                    self._vetoes.get(ExitReason.PRICE_UNUSABLE, 0) + 1
+                )
+                _log.critical(
+                    "risk.exit_price_unusable",
+                    symbol=symbol,
+                    raw_ltp=repr(raw_ltp),
+                    direction=record.direction,
+                    quantity=record.quantity,
+                    action="EXIT_MARKET_IMMEDIATE (fail-safe: cannot prove the position is safe)",
+                )
+                decisions.append(
+                    ExitDecision(
+                        symbol=symbol,
+                        reason=ExitReason.PRICE_UNUSABLE,
+                        direction=record.direction,
+                        quantity=record.quantity,
+                        ltp=Decimal("0"),
+                        threshold=Decimal("0"),
+                        at_ist=at,
+                    )
+                )
+        return tuple(decisions)
+
+    def evaluate(
+        self,
+        symbol: str,
+        *,
+        required_margin: Decimal | None = None,
+        direction: str | None = None,
+        quote: tuple[float, float] | None = None,
+    ) -> RiskDecision:
         """Run the gate and return the full decision. Never raises.
 
         Args:
@@ -184,12 +443,18 @@ class RiskEngine:
             required_margin: rupees the intended order will block, when the caller knows it.
                 Omitted, check 10 verifies only that the broker reports positive, defined free
                 cash — see :meth:`_check_margin`.
+            direction: ``"LONG"`` or ``"SHORT"`` when the caller knows which way the signal
+                points. The overextension check (12) vetoes only LONG entries; without a
+                direction the check cannot attribute the signal and passes through.
+            quote: ``(ltp, session_vwap)`` as evaluated by the caller's own signal step.
+                Preferred over the wired :attr:`QuoteProvider` because it is the exact pair
+                the signal was derived from — no chance of drift between the two reads.
 
         Short-circuits on the first failure; later checks are not evaluated.
         """
         at = self._now()
 
-        for name, check in self._checks(symbol, required_margin):
+        for name, check in self._checks(symbol, required_margin, direction, quote):
             result = self._guarded(name, check)
             if result is not None:
                 reason, detail = result
@@ -214,9 +479,9 @@ class RiskEngine:
         return RiskDecision(allowed=True, symbol=symbol, at_ist=at)
 
     @property
-    def veto_counts(self) -> dict[VetoReason, int]:
+    def veto_counts(self) -> dict[str, int]:
         """How often each reason has fired. Telemetry only."""
-        return dict(self._vetoes)
+        return {reason.value: count for reason, count in self._vetoes.items()}
 
     # ── plumbing ─────────────────────────────────────────────────────────────
 
@@ -251,7 +516,11 @@ class RiskEngine:
             )
 
     def _checks(
-        self, symbol: str, required_margin: Decimal | None = None
+        self,
+        symbol: str,
+        required_margin: Decimal | None = None,
+        direction: str | None = None,
+        quote: tuple[float, float] | None = None,
     ) -> tuple[tuple[str, Check], ...]:
         """The gate, in evaluation order."""
         return (
@@ -265,6 +534,10 @@ class RiskEngine:
             ("symbol_allowed", lambda: self._check_symbol_allowed(symbol)),
             ("reentry_cooldown", lambda: self._check_cooldown(symbol)),
             ("sentinel", lambda: self._check_sentinel(symbol)),
+            (
+                "vwap_overextended",
+                lambda: self._check_vwap_extension(symbol, direction, quote),
+            ),
             ("margin", lambda: self._check_margin(required_margin)),
         )
 
@@ -386,6 +659,90 @@ class RiskEngine:
         blocked, reason = self._macro.blocks_entry(symbol, now_ist(self._clock))
         if blocked:
             return (VetoReason.SENTINEL_RISK_OFF, reason)
+        return None
+
+    def _check_vwap_extension(
+        self,
+        symbol: str,
+        direction: str | None,
+        quote: tuple[float, float] | None,
+    ) -> CheckResult:
+        """12. The overextension guardrail — no chasing a vertical breakout (§4).
+
+        A LONG whose LTP sits more than ``strategy.max_vwap_extension_pct`` above session
+        VWAP is refused. Buying there means paying the top of a momentum spike; the fill is
+        followed immediately by mean reversion against the position. SHORT entries are
+        deliberately untouched — the rule guards the "buying the top" failure, and shorting
+        an overextended name is its own strategy decision.
+
+        The volatility-aware clause consults :class:`VWAPZScoreFilter` accumulators fed by
+        the tick path (:meth:`observe_tick`): a LONG is also refused when the quote LTP
+        itself scores more than ``+vwap_z_threshold`` (default +2σ) above session VWAP in
+        the session's own realised, volume-weighted dispersion. Scoring is pure — it reads
+        the accumulators, never writes them — so the verdict tracks the price actually
+        being authorised, not whichever print arrived last. Percentage and z-score are two
+        views of the same failure — chasing exhaustion — so both report under
+        ``VWAP_OVEREXTENDED``; either firing vetoes.
+
+        The caller-supplied ``quote`` — the exact ``(ltp, session_vwap)`` the signal step
+        evaluated — is preferred over the wired provider, which re-reads live aggregator
+        state and could have drifted since. Data policy:
+
+        * **Quote unavailable** (no explicit quote, no wired provider) disables only the
+          *percentage* clause for this evaluation. The z-score clause is independent of
+          VWAP quotes and still runs: it scores the quote LTP when one exists, otherwise
+          the accumulator's most recent print. Track 2's ExecutionRouter arrives exactly
+          this way — actions carry a token and a price context, not a signal-step VWAP
+          pair — and must still be guarded.
+        * **No z-score accumulator** for the symbol (no ticks observed yet, or its feed
+          failed) passes the clause — absence of evidence is not evidence of extension,
+          and the percentage check still guards the entry when it has inputs.
+        * A provider that **raises** still vetoes, via :meth:`_guarded`.
+        """
+        if direction is None or direction.upper() != "LONG":
+            return None
+
+        ltp: float | None = None
+
+        if quote is None and self._quote_provider is not None:
+            # A raising provider vetoes upstream, via _guarded.
+            quote = self._quote_provider(symbol)
+        if quote is not None:
+            vwap = quote[1]
+            ltp = quote[0]
+            if (
+                not math.isfinite(ltp)
+                or not math.isfinite(vwap)
+                or vwap <= 0.0
+                or ltp <= 0.0
+            ):
+                return None
+
+            extension_pct = (ltp - vwap) / vwap * 100.0
+            limit_pct = self._settings.strategy.max_vwap_extension_pct
+            if extension_pct > limit_pct:
+                return (
+                    VetoReason.VWAP_OVEREXTENDED,
+                    f"LTP {ltp:.2f} is {extension_pct:.2f}% above session VWAP "
+                    f"{vwap:.2f} (limit {limit_pct:.2f}%) — refusing to chase the breakout",
+                )
+
+        z_track = self._vwap_filters.get(symbol)
+        if z_track is None:
+            return None
+
+        z_price = ltp if ltp is not None else z_track.last_price
+        if z_price is None or not math.isfinite(z_price):
+            return None
+
+        overextended, z_vwap, sigma, z_score = z_track.filter.score(z_price)
+        if bool(overextended):
+            return (
+                VetoReason.VWAP_OVEREXTENDED,
+                f"price {z_price:.2f} is {float(z_score):.2f}σ above session VWAP "
+                f"{float(z_vwap):.2f} (σ={float(sigma):.4f}, limit "
+                f"{self._vwap_z_threshold:.2f}σ) — refusing to chase the breakout",
+            )
         return None
 
     def _check_margin(self, required: Decimal | None = None) -> CheckResult:

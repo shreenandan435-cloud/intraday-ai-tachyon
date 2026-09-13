@@ -37,11 +37,18 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable
-from datetime import date
+from datetime import date, time
 from decimal import Decimal
 from typing import Final
 
-from tachyon.core.clock import SYSTEM_CLOCK, Clock, SessionEvent, SessionWatchdog, now_ist
+from tachyon.core.clock import (
+    SYSTEM_CLOCK,
+    Clock,
+    MonotonicDeadline,
+    SessionEvent,
+    SessionWatchdog,
+    now_ist,
+)
 from tachyon.core.constants import WATCHDOG_TICK
 from tachyon.core.logger import get_logger
 from tachyon.core.state import StateMachine, StateTransitionError, TradingState
@@ -127,12 +134,23 @@ class SquareOffWatchdog:
         drawdown_probe: DrawdownProbe | None = None,
         drawdown_limit: Decimal = ZERO,
         on_drawdown_breach: DrawdownBreachAction | None = None,
+        squareoff_override_time: time | None = None,
     ) -> None:
         self._state_machine = state_machine
         self._on_square_off = on_square_off
         self._clock = clock
         self._tick = tick_seconds
         self._session = SessionWatchdog.arm_for_today(clock, on_date=on_date)
+        # Optional square‑off deadline override (offline test mode).
+        if squareoff_override_time is not None:
+            # Re‑arm the SQUARE_OFF checkpoint to the supplied time on the same session date.
+            today_date = self._session.deadlines[SessionEvent.SQUARE_OFF].target_wall.date()
+            self._session.deadlines[SessionEvent.SQUARE_OFF] = MonotonicDeadline.arm(
+                SessionEvent.SQUARE_OFF.value,
+                squareoff_override_time,
+                clock=self._clock,
+                on_date=today_date,
+            )
 
         # The drawdown hard-stop (CLAUDE.md §1.2). Polled here as well as on every P&L update
         # because this thread runs on a monotonic clock and is immortal: a Brain that has

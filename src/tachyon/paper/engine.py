@@ -19,11 +19,11 @@ import random
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, date
-from decimal import Decimal, ROUND_HALF_UP
-from enum import Enum
+from datetime import datetime
+from decimal import ROUND_HALF_UP, Decimal
+from enum import StrEnum
 from pathlib import Path
-from typing import Any, Final, Literal, Optional
+from typing import Any, Final, Literal
 from uuid import uuid4
 
 import pyarrow as pa
@@ -71,12 +71,12 @@ TELEMETRY_DIR.mkdir(parents=True, exist_ok=True)
 # ── Enums ────────────────────────────────────────────────────────────────────
 
 
-class OrderSide(str, Enum):
+class OrderSide(StrEnum):
     BUY = "BUY"
     SELL = "SELL"
 
 
-class OrderStatus(str, Enum):
+class OrderStatus(StrEnum):
     PENDING = "PENDING"
     FILLED = "FILLED"
     PARTIAL = "PARTIAL"
@@ -84,7 +84,7 @@ class OrderStatus(str, Enum):
     CANCELLED = "CANCELLED"
 
 
-class ExitReason(str, Enum):
+class ExitReason(StrEnum):
     STOP_LOSS = "STOP_LOSS"
     TARGET = "TARGET"
     SQUARE_OFF = "SQUARE_OFF"
@@ -105,7 +105,7 @@ class PaperOrder:
     quantity: int
     price: Decimal
     order_type: Literal["MARKET", "LIMIT", "SL", "SL-M"] = "MARKET"
-    trigger_price: Optional[Decimal] = None
+    trigger_price: Decimal | None = None
     status: OrderStatus = OrderStatus.PENDING
     filled_quantity: int = 0
     avg_fill_price: Decimal = Decimal("0")
@@ -127,7 +127,7 @@ class PaperPosition:
     entry_time: datetime
     order_id: str
     unrealised_pnl: Decimal = field(default_factory=lambda: Decimal("0"))
-    trailing_stop: Optional[Decimal] = None
+    trailing_stop: Decimal | None = None
     trail_activated: bool = False
 
 
@@ -180,9 +180,8 @@ class ChargesCalculator:
         side: OrderSide,
         quantity: int,
         price: Decimal,
-        is_intraday: bool = True,
     ) -> dict[str, Decimal]:
-        """Calculate all charges for a trade."""
+        """Calculate all charges for a trade (intraday — the only engine mode)."""
         turnover = Decimal(quantity) * price
 
         # Brokerage
@@ -194,7 +193,9 @@ class ChargesCalculator:
             stt = (turnover * STT_RATE).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
         # Exchange transaction charges
-        exchange_charge = (turnover * EXCHANGE_TXN_CHARGE).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        exchange_charge = (turnover * EXCHANGE_TXN_CHARGE).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
 
         # SEBI fees
         sebi_fee = (turnover * SEBI_RATE).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
@@ -202,7 +203,9 @@ class ChargesCalculator:
         # Stamp duty (on buy side)
         stamp_duty = Decimal("0")
         if side == OrderSide.BUY:
-            stamp_duty = (turnover * STAMP_DUTY_RATE).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            stamp_duty = (turnover * STAMP_DUTY_RATE).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
 
         # GST on brokerage + exchange charges
         taxable = brokerage + exchange_charge
@@ -256,9 +259,8 @@ class MarketSimulator:
         if side == OrderSide.BUY:
             # Pay more when buying
             return price * (Decimal("1") + slippage_factor)
-        else:
-            # Receive less when selling
-            return price * (Decimal("1") - slippage_factor)
+        # Receive less when selling
+        return price * (Decimal("1") - slippage_factor)
 
     def simulate_partial_fill(self, quantity: int, probability: float = 0.05) -> int:
         """Simulate partial fill (rare in liquid stocks)."""
@@ -283,7 +285,9 @@ class PaperTradingEngine:
         self._clock = clock
 
         # Initialize account
-        capital = virtual_capital or Decimal(str(os.environ.get("PAPER_TRADING_BUDGET_INR", "100000")))
+        capital = virtual_capital or Decimal(
+            str(os.environ.get("PAPER_TRADING_BUDGET_INR", "100000"))
+        )
         self._account = PaperAccount(
             virtual_capital=capital,
             available_cash=capital,
@@ -322,7 +326,7 @@ class PaperTradingEngine:
         self._rotate_trade_csv()
 
         # Start background flush task
-        self._flush_task: "asyncio.Task[None] | None" = None
+        self._flush_task: asyncio.Task[None] | None = None
         self._running = False
 
     async def start(self) -> None:
@@ -351,7 +355,9 @@ class PaperTradingEngine:
             self._trade_file_handle.close()
 
         file_exists = csv_path.exists()
-        self._trade_file_handle = open(csv_path, "a", newline="", encoding="utf-8")
+        # Long-lived handle by design — one CSV writer held for the trading day,
+        # closed via stop()/_rotate_trade_csv(). See rollout.py for the same pattern.
+        self._trade_file_handle = csv_path.open("a", newline="", encoding="utf-8")  # noqa: SIM115
         self._trade_file = csv.writer(self._trade_file_handle)
 
         if not file_exists:
@@ -409,9 +415,9 @@ class PaperTradingEngine:
         quantity: int,
         price: Decimal,
         order_type: Literal["MARKET", "LIMIT", "SL", "SL-M"] = "MARKET",
-        trigger_price: Optional[Decimal] = None,
-        stop_loss: Optional[Decimal] = None,
-        target: Optional[Decimal] = None,
+        trigger_price: Decimal | None = None,
+        stop_loss: Decimal | None = None,
+        target: Decimal | None = None,
         order_tag: str = "",
         is_exit: bool = False,
     ) -> PaperOrder:
@@ -460,9 +466,9 @@ class PaperTradingEngine:
         quantity: int,
         price: Decimal,
         order_type: Literal["MARKET", "LIMIT", "SL", "SL-M"] = "MARKET",
-        trigger_price: Optional[Decimal] = None,
-        stop_loss: Optional[Decimal] = None,
-        target: Optional[Decimal] = None,
+        trigger_price: Decimal | None = None,
+        stop_loss: Decimal | None = None,
+        target: Decimal | None = None,
         order_tag: str = "",
         is_exit: bool = False,
     ) -> PaperOrder:
@@ -483,8 +489,8 @@ class PaperTradingEngine:
     async def _execute_order(
         self,
         order: PaperOrder,
-        stop_loss: Optional[Decimal],
-        target: Optional[Decimal],
+        stop_loss: Decimal | None,
+        target: Decimal | None,
     ) -> None:
         """Simulate order execution with latency and slippage."""
         # Simulate latency
@@ -521,7 +527,7 @@ class PaperTradingEngine:
             if order.is_exit:
                 await self._close_position(order, fill_price, fill_qty, total_charges)
             else:
-                await self._open_position(order, fill_price, fill_qty, total_charges, stop_loss, target)
+                await self._open_position(order, fill_price, fill_qty, stop_loss, target)
 
             # Log trade
             self._log_telemetry({
@@ -540,11 +546,10 @@ class PaperTradingEngine:
         order: PaperOrder,
         fill_price: Decimal,
         fill_qty: int,
-        charges: Decimal,
-        stop_loss: Optional[Decimal],
-        target: Optional[Decimal],
+        stop_loss: Decimal | None,
+        target: Decimal | None,
     ) -> None:
-        """Open a new position."""
+        """Open a new position. Charges accrue at exit, not entry (see _close_position)."""
         position = PaperPosition(
             symbol=order.symbol,
             quantity=fill_qty,
@@ -661,7 +666,7 @@ class PaperTradingEngine:
 
     # ── Position Management ───────────────────────────────────────────────────
 
-    def update_mark_to_market(self, symbol: str, ltp: Decimal) -> Optional[Decimal]:
+    def update_mark_to_market(self, symbol: str, ltp: Decimal) -> Decimal | None:
         """Update unrealised P&L for a position."""
         with self._lock:
             position = self._positions.get(symbol)
@@ -680,10 +685,12 @@ class PaperTradingEngine:
             )
 
             # Check trailing stop
-            if position.trail_activated and position.trailing_stop:
-                if position.side == OrderSide.BUY and ltp <= position.trailing_stop:
-                    return self._trigger_stop_loss(symbol, ltp)
-                elif position.side == OrderSide.SELL and ltp >= position.trailing_stop:
+            if position.trail_activated and position.trailing_stop is not None:
+                trail_hit = (
+                    (position.side == OrderSide.BUY and ltp <= position.trailing_stop)
+                    or (position.side == OrderSide.SELL and ltp >= position.trailing_stop)
+                )
+                if trail_hit:
                     return self._trigger_stop_loss(symbol, ltp)
 
             return unrealised

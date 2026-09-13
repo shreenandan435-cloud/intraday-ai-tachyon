@@ -11,16 +11,19 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import importlib.util
+import logging
+import os
 import signal
-import sys
+import socket
 import threading
-from contextlib import suppress
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any
 
 from tachyon.core.clock import SYSTEM_CLOCK, Clock
-from tachyon.core.logger import get_logger, shutdown_logging
+from tachyon.core.logger import get_logger
 
 _log = get_logger(__name__)
 
@@ -110,9 +113,19 @@ class ShutdownCoordinator:
 
             try:
                 # Run with timeout
-                await asyncio.wait_for(phase.coroutine(), timeout=phase.timeout)
+                # Safely invoke coroutine if it returns an awaitable
+                coro_result = phase.coroutine()
+                if coro_result is not None:
+                    # If the result is a coroutine or Task, await it with timeout
+                    if asyncio.iscoroutine(coro_result) or isinstance(coro_result, asyncio.Task):
+                        await asyncio.wait_for(coro_result, timeout=phase.timeout)
+                    else:
+                        # Non‑awaitable result; log and continue
+                        _log.debug("shutdown.phase_nonawaitable", phase=phase.name)
+                else:
+                    _log.debug("shutdown.phase_none", phase=phase.name)
                 _log.info("shutdown.phase_complete", phase=phase.name, duration="<timeout")
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 _log.error(
                     "shutdown.phase_timeout",
                     phase=phase.name,
@@ -139,25 +152,24 @@ class ShutdownCoordinator:
 
 def install_signal_handlers(
     coordinator: ShutdownCoordinator,
-    loop: Optional[asyncio.AbstractEventLoop] = None,
+    loop: asyncio.AbstractEventLoop | None = None,
 ) -> None:
     """Install SIGTERM/SIGINT handlers for graceful shutdown.
 
     On Windows, uses signal.signal (no loop.add_signal_handler).
     On POSIX, uses loop.add_signal_handler for proper async integration.
     """
-    def handle_signal(signum: int, frame: Any) -> None:
+
+    def handle_signal(signum: int, _frame: Any) -> None:
         signal_name = signal.Signals(signum).name
         exit_code = EXIT_SIGTERM if signum == signal.SIGTERM else EXIT_SIGINT
         coordinator.request_shutdown(signal_name, exit_code)
 
         # If loop is running, schedule the shutdown coroutine
         if loop and not loop.is_closed():
-            try:
-                loop.call_soon_threadsafe(asyncio.create_task, coordinator.execute_shutdown())
-            except RuntimeError:
+            with contextlib.suppress(RuntimeError):
                 # Loop may be closing or not running
-                pass
+                loop.call_soon_threadsafe(asyncio.create_task, coordinator.execute_shutdown())
 
     # Install handlers
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -188,7 +200,7 @@ class GracefulShutdown:
 
     def __init__(
         self,
-        loop: Optional[asyncio.AbstractEventLoop] = None,
+        loop: asyncio.AbstractEventLoop | None = None,
         clock: Clock = SYSTEM_CLOCK,
     ):
         self._coordinator = ShutdownCoordinator(clock)
@@ -215,10 +227,18 @@ class GracefulShutdown:
         self._coordinator.register_phase(name, coroutine, timeout, critical)
 
     async def wait_for_shutdown(self) -> int:
-        """Wait for shutdown signal and execute teardown."""
-        # threading.Event.wait() is synchronous, run in executor
+        """Wait for shutdown signal and execute teardown.
+
+        Polls the flag in bounded slices instead of one unbounded blocking wait: a single
+        ``run_in_executor(None, event.wait)`` parks a pool thread forever, and if this
+        coroutine is cancelled that thread can never be interrupted — it leaks and, being
+        non-daemon, blocks interpreter exit. A timed wait releases the worker each slice so
+        cancellation can take effect between slices. ``threading.Event`` is retained (it is
+        thread-safe for signal handlers); only the waiting strategy changes.
+        """
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._coordinator._shutdown_event.wait)
+        while not self._coordinator._shutdown_event.is_set():
+            await loop.run_in_executor(None, self._coordinator._shutdown_event.wait, 0.5)
         return await self._coordinator.execute_shutdown()
 
     def request_shutdown(self, reason: str = "manual", exit_code: int = EXIT_CLEAN) -> None:
@@ -229,20 +249,20 @@ class GracefulShutdown:
 # ── Utility Functions ────────────────────────────────────────────────────────
 
 
-async def flush_all_logs(timeout: float = FLUSH_TIMEOUT_SECONDS) -> None:
-    """Flush all logging handlers."""
-    import logging
+async def flush_all_logs(_timeout: float = FLUSH_TIMEOUT_SECONDS) -> None:
+    """Flush all logging handlers.
 
+    ``_timeout`` is accepted for forward-compatibility with a bounded flush; it is
+    currently advisory because ``logging`` handler flushes are synchronous.
+    """
     for handler in logging.getLogger().handlers:
         if hasattr(handler, "flush"):
-            with suppress(Exception):
+            with contextlib.suppress(Exception):
                 handler.flush()
 
     # Wait a bit for background threads, but don't let cancellation propagate
-    try:
+    with contextlib.suppress(asyncio.CancelledError):
         await asyncio.sleep(0.1)
-    except asyncio.CancelledError:
-        pass
 
 
 async def close_client_sessions() -> None:
@@ -258,19 +278,14 @@ def create_shutdown_coordinator(clock: Clock = SYSTEM_CLOCK) -> ShutdownCoordina
 
 # ── Systemd Integration ──────────────────────────────────────────────────────
 
-
-# ── Systemd Integration ──────────────────────────────────────────────────────
-
-import os
-import socket
-import sys
-
-# Check if sdnotify is available
-try:
-    import sdnotify  # type: ignore[import-not-found]
-    _SDNOTIFY_AVAILABLE = True
-except ImportError:
-    _SDNOTIFY_AVAILABLE = False
+# sd_notify is a Linux systemd protocol; AF_UNIX sockets do not exist on Windows.
+# Probing with find_spec keeps ``sdnotify`` an optional dependency without importing
+# it, so the engine boots cleanly (no ModuleNotFoundError) on any platform.
+# NOTE: os.name (not sys.platform) — mypy const-folds sys.platform comparisons per
+# --platform and would mark the systemd branches unreachable on a Windows check.
+_SDNOTIFY_AVAILABLE: bool = (
+    os.name == "posix" and importlib.util.find_spec("sdnotify") is not None
+)
 
 # AF_UNIX is not available on Windows
 _AF_UNIX = getattr(socket, "AF_UNIX", None)
@@ -278,16 +293,24 @@ _AF_UNIX = getattr(socket, "AF_UNIX", None)
 
 def is_systemd() -> bool:
     """Check if running under systemd."""
+    if os.name != "posix":
+        return False
     return Path("/run/systemd/system").exists() or "SYSTEMD_EXEC_PID" in os.environ
 
 
 def notify_systemd_ready() -> None:
-    """Notify systemd that service is ready (sd_notify)."""
+    """Notify systemd that service is ready (sd_notify).
+
+    No-op outside systemd (Windows, bare-metal, containers): the sdnotify
+    module is only imported inside the guard, so a missing install can never
+    raise ModuleNotFoundError on the boot path.
+    """
     if not is_systemd():
         return
 
     if _SDNOTIFY_AVAILABLE:
         import sdnotify
+
         notifier = sdnotify.SystemdNotifier()
         notifier.notify("READY=1")
         return
@@ -310,5 +333,6 @@ def notify_systemd_stopping() -> None:
 
     if _SDNOTIFY_AVAILABLE:
         import sdnotify
+
         notifier = sdnotify.SystemdNotifier()
         notifier.notify("STOPPING=1")

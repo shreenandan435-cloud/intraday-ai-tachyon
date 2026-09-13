@@ -12,29 +12,47 @@ which under an absolute-value ranking beats every genuine mover on the board.
 
 from __future__ import annotations
 
+import json
+from datetime import datetime, time
 from decimal import Decimal
 from typing import Any
 
 import httpx
 import pytest
 
+from tachyon.core.clock import IST, ManualClock, ist_at
 from tachyon.ingestion.instruments import InstrumentRecord
 from tachyon.strategy.scanner import (
+    DEFAULT_ROTATION_TIMES,
     DEFAULT_SELECTION_SIZE,
+    DEFAULT_TURNOVER_PERCENTILE,
     EQUITY_SERIES,
     INTRADAY_LEVERAGE,
     MIN_PREOPEN_TURNOVER_INR,
+    MIN_TURNOVER_SAMPLE,
     PENNY_PRICE_FLOOR_INR,
+    TURNOVER_BACKSTOP_INR,
+    AngelMoversSource,
     Candidate,
+    DualSourcePreOpen,
+    IntradayScanner,
     MasterSymbolResolver,
     NsePreOpenSource,
     PreMarketScanner,
     PreOpenFetchError,
     PreOpenQuote,
+    RankingWeights,
     RejectReason,
+    RotationScheduler,
+    composite_scores,
+    cross_sectional_z,
     gap_percent,
     margin_per_share,
+    parse_angel_movers,
     parse_nse_pre_open,
+    percentile_turnover_floor,
+    plan_rotation,
+    rvol_values,
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -54,9 +72,17 @@ def _quote(
     *,
     turnover: Decimal | None = LIQUID,
     series: str = EQUITY_SERIES,
+    volume: Decimal | None = None,
+    spread_bps: Decimal | None = None,
 ) -> PreOpenQuote:
     return PreOpenQuote(
-        symbol, Decimal(previous_close), Decimal(pre_open), turnover=turnover, series=series
+        symbol,
+        Decimal(previous_close),
+        Decimal(pre_open),
+        turnover=turnover,
+        series=series,
+        volume=volume,
+        spread_bps=spread_bps,
     )
 
 
@@ -884,3 +910,718 @@ class TestMasterSymbolResolver:
         record = resolver.resolve("DUP")
         assert record is not None
         assert record.token == "first"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Dynamic liquidity floor
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestPercentileTurnoverFloor:
+    """The nearest-rank percentile of published positive turnovers."""
+
+    def test_it_returns_an_observed_value_never_an_interpolation(self) -> None:
+        values = ("100", "200", "300", "400", "500", "600", "700", "800", "900", "1000")
+        turnovers = [Decimal(n) for n in values]
+        assert percentile_turnover_floor(turnovers, 90.0) == Decimal("900")
+
+    def test_top_decile_of_a_realistic_board(self) -> None:
+        """p90 of 20 symbols: rank ceil(0.9 * 20) = 18 → the third-largest value."""
+        turnovers = [Decimal(i * 1_000_000) for i in range(1, 21)]
+        assert percentile_turnover_floor(turnovers, 90.0) == Decimal("18000000")
+
+    def test_non_positive_turnovers_are_excluded(self) -> None:
+        turnovers = [Decimal("-5"), Decimal("0"), *(Decimal(i) for i in range(1, 11))]
+        assert percentile_turnover_floor(turnovers, 100.0) == Decimal("10")
+
+    def test_a_sample_below_the_minimum_is_uncomputable(self) -> None:
+        """Fewer than MIN_TURNOVER_SAMPLE rows: a quantile of a handful is noise, and the
+        caller falls back to the static floor rather than trusting it."""
+        few = [Decimal("1000000")] * (MIN_TURNOVER_SAMPLE - 1)
+        assert percentile_turnover_floor(few, 90.0) is None
+
+    def test_an_empty_sample_is_uncomputable(self) -> None:
+        assert percentile_turnover_floor((), 90.0) is None
+
+    @pytest.mark.parametrize("percentile", [0.0, -1.0, 100.1])
+    def test_an_out_of_range_percentile_is_refused(self, percentile: float) -> None:
+        with pytest.raises(ValueError, match="percentile must be in"):
+            percentile_turnover_floor([Decimal("1")] * MIN_TURNOVER_SAMPLE, percentile)
+
+
+class TestDynamicTurnoverFloor:
+    """The scanner's liquidity floor, derived from the board instead of a rigid constant."""
+
+    @staticmethod
+    def _board_of_ten() -> tuple[PreOpenQuote, ...]:
+        """Ten EQ symbols, turnovers 1cr..10cr, gaps all +5% so only liquidity varies."""
+        return tuple(
+            _quote(f"S{i:02d}", "1000", "1050", turnover=Decimal(i * 10_000_000))
+            for i in range(1, 11)
+        )
+
+    def test_static_mode_is_unchanged_and_labelled(self) -> None:
+        """No percentile → the configured rupee floor, exactly as before."""
+        board = self._board_of_ten()
+        result = _scanner(quotes=board, size=10).select(board, budget=Decimal("50000"))
+        assert result.floor_source == "static"
+        assert result.min_turnover == MIN_PREOPEN_TURNOVER_INR
+
+    def test_the_top_decile_floor_is_derived_from_the_board(self) -> None:
+        """p90 of 1cr..10cr is 9cr: the eight thinnest symbols drop, two survive."""
+        board = self._board_of_ten()
+        master = {
+            quote.symbol: _record(quote.symbol, str(index)) for index, quote in enumerate(board)
+        }
+        scanner = _scanner(quotes=board, master=master, size=10, turnover_percentile=90.0)
+
+        result = scanner.select(board, budget=Decimal("50000"))
+
+        assert result.floor_source == "percentile"
+        assert result.min_turnover == Decimal("90000000")
+        # Gaps all tie at +5 %, so the turnover term orders the survivors: S10 first.
+        assert result.symbols == ("S10", "S09")
+        assert result.rejection_counts()["BELOW_TURNOVER_FLOOR"] == 8
+
+    def test_the_floor_adapts_down_on_a_thin_day(self) -> None:
+        """The rigidity the dynamic floor removes: on a board where everything matches
+        ~Rs.20 lakh, the static 1cr floor rejects the entire board and the session starts
+        blind. The percentile floor keeps the top of what the day actually offers."""
+        thin = tuple(
+            _quote(f"T{i:02d}", "1000", "1050", turnover=Decimal(1_500_000 + i * 100_000))
+            for i in range(10)
+        )
+        master = {
+            quote.symbol: _record(quote.symbol, str(index)) for index, quote in enumerate(thin)
+        }
+        static = _scanner(quotes=thin, master=master, size=10).select(
+            thin, budget=Decimal("50000")
+        )
+        dynamic = _scanner(
+            quotes=thin, master=master, size=10, turnover_percentile=90.0
+        ).select(thin, budget=Decimal("50000"))
+
+        assert static.symbols == ()
+        assert dynamic.floor_source == "percentile"
+        # Nearest-rank p90 of ten rows is the ninth value; the boundary value itself passes,
+        # so the two deepest symbols survive where the static floor admitted none.
+        assert dynamic.symbols == ("T09", "T08")
+
+    def test_the_backstop_bounds_the_percentile_from_below(self) -> None:
+        """A universally dead board's top decile is still dead. The percentile may adapt,
+        but it may not bottom out below the backstop."""
+        dead = tuple(
+            _quote(f"D{i:02d}", "1000", "1050", turnover=Decimal(10_000 + i * 1_000))
+            for i in range(10)
+        )
+        result = _scanner(quotes=dead, size=10, turnover_percentile=90.0).select(
+            dead, budget=Decimal("50000")
+        )
+
+        assert result.floor_source == "backstop"
+        assert result.min_turnover == TURNOVER_BACKSTOP_INR
+        assert result.symbols == ()
+
+    def test_an_uncomputable_percentile_falls_back_to_the_static_floor(self) -> None:
+        """Too few published turnovers → the scan may only ever produce less, so the known
+        floor stands rather than a quantile of three rows."""
+        sparse = tuple(
+            _quote(f"P{i}", "1000", "1050", turnover=Decimal(50_000_000) if i < 3 else None)
+            for i in range(6)
+        )
+        result = _scanner(quotes=sparse, size=6, turnover_percentile=90.0).select(
+            sparse, budget=Decimal("50000")
+        )
+
+        assert result.floor_source == "fallback-static"
+        assert result.min_turnover == MIN_PREOPEN_TURNOVER_INR
+
+    def test_the_result_reports_the_floor_it_applied(self) -> None:
+        board = self._board_of_ten()
+        result = _scanner(quotes=board, size=10, turnover_percentile=90.0).select(
+            board, budget=Decimal("50000")
+        )
+        assert result.min_turnover == Decimal("90000000")
+        assert result.floor_source == "percentile"
+
+    @pytest.mark.parametrize(
+        ("kwargs", "match"),
+        [
+            ({"turnover_percentile": 0.0}, "turnover_percentile must be in"),
+            ({"turnover_percentile": 100.5}, "turnover_percentile must be in"),
+            ({"turnover_backstop": Decimal("-1")}, "turnover_backstop must not be negative"),
+        ],
+    )
+    def test_nonsense_dynamic_parameters_are_refused(
+        self, kwargs: dict[str, Any], match: str
+    ) -> None:
+        with pytest.raises(ValueError, match=match):
+            PreMarketScanner(source=_StaticSource(), resolver=_StaticResolver({}), **kwargs)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Composite ranking score
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestCrossSectionalZ:
+    def test_it_standardises_to_mean_zero_unit_variance(self) -> None:
+        z = cross_sectional_z([1.0, 2.0, 3.0, 4.0])
+        assert sum(z) == pytest.approx(0.0, abs=1e-12)
+        assert max(z) == pytest.approx(1.3416407864998738)  # population std, not sample
+
+    def test_a_single_value_is_not_a_cross_section(self) -> None:
+        assert cross_sectional_z([42.0]) == (0.0,)
+
+    def test_a_tied_section_contributes_nothing(self) -> None:
+        """Every symbol with the same turnover: the term drops out instead of dividing
+        by zero. This is what keeps tied boards ranked purely by gap."""
+        assert cross_sectional_z([5.0, 5.0, 5.0]) == (0.0, 0.0, 0.0)
+
+    def test_empty_in_empty_out(self) -> None:
+        assert cross_sectional_z([]) == ()
+
+
+class TestRvolValues:
+    @staticmethod
+    def _q(symbol: str, volume: Decimal | None) -> PreOpenQuote:
+        return _quote(symbol, "100", "110", volume=volume)
+
+    def test_it_is_volume_relative_to_the_cross_sectional_mean(self) -> None:
+        quotes = (self._q("A", Decimal("100")), self._q("B", Decimal("300")))
+        # mean of positives = 200 → 0.5x and 1.5x
+        assert rvol_values(quotes) == (0.5, 1.5)
+
+    def test_a_source_without_volumes_drops_the_term_section_wide(self) -> None:
+        """No invented proxies: turnover/price would double-count the turnover term while
+        smuggling in a price correlation."""
+        quotes = (self._q("A", None), self._q("B", None))
+        assert rvol_values(quotes) == (0.0, 0.0)
+
+    def test_a_single_published_volume_is_not_relative(self) -> None:
+        quotes = (self._q("A", Decimal("100")), self._q("B", None))
+        assert rvol_values(quotes) == (0.0, 0.0)
+
+
+class TestCompositeScores:
+    def test_the_spread_penalty_is_subtracted_in_raw_basis_points(self) -> None:
+        quotes = (
+            _quote("TIGHT", "100", "110", spread_bps=Decimal("2")),
+            _quote("WIDE", "100", "110", spread_bps=Decimal("50")),
+        )
+        # Identical gaps and tied turnovers zero those terms; the spread penalty stands alone.
+        weights = RankingWeights(w_gap=1.0, w_turnover=0.0, w_rvol=0.0, w_spread=0.5)
+        tight, wide = composite_scores(quotes, weights)
+        assert tight == pytest.approx(-1.0)
+        assert wide == pytest.approx(-25.0)
+
+    def test_the_gap_term_uses_magnitude_so_a_fall_ranks_with_a_rise(self) -> None:
+        """§4.1 is symmetric: a signed z would rank the day's biggest faller last."""
+        quotes = (
+            _quote("FALLER", "1000", "900"),  # -10 %
+            _quote("RISER", "1000", "1050"),  # +5 %
+            _quote("QUIET", "1000", "1000"),  # 0 %
+        )
+        weights = RankingWeights(w_turnover=0.0, w_rvol=0.0, w_spread=0.0)
+        faller, riser, quiet = composite_scores(quotes, weights)
+        assert faller > riser > quiet
+
+    def test_turnover_is_log_scaled_before_standardisation(self) -> None:
+        """One mega-cap must not pin the rest of the board at z≈0."""
+        quotes = (
+            _quote("MEGA", "100", "110", turnover=Decimal("100000000000")),  # 1e11
+            _quote("MID", "100", "110", turnover=Decimal("100000000")),  # 1e8
+            _quote("SMALL", "100", "110", turnover=Decimal("10000000")),  # 1e7
+        )
+        weights = RankingWeights(w_gap=0.0, w_rvol=0.0, w_spread=0.0)
+        mega, mid, small = composite_scores(quotes, weights)
+        # log10: 11, 8, 7 → z-scores all O(1); raw turnover would skew one mega-cap to dominate.
+        assert mega > mid > small
+        assert mid - small == pytest.approx(0.588348405414552, rel=1e-9)
+
+    def test_missing_spread_is_neutral_not_a_bonus(self) -> None:
+        quotes = (
+            _quote("NOSPREAD", "100", "110", spread_bps=None),
+            _quote("SOME", "100", "110", spread_bps=Decimal("5")),
+        )
+        # Identical gaps zero the gap term; the spread term is the only thing that can differ.
+        weights = RankingWeights(w_gap=1.0, w_turnover=0.0, w_rvol=0.0, w_spread=1.0)
+        none, some = composite_scores(quotes, weights)
+        assert none == pytest.approx(0.0)
+        assert some == pytest.approx(-5.0)
+
+    def test_empty_board_scores_empty(self) -> None:
+        assert composite_scores((), RankingWeights()) == ()
+
+    def test_default_weights_collapse_to_gap_order_when_liquidity_ties(self) -> None:
+        """The backward-compatibility guarantee: on the NSE pre-open document (no volume,
+        no spread) with tied turnovers, the composite reduces to the original |gap| order."""
+        quotes = _BOARD  # four symbols, identical LIQUID turnover
+        symbols = (q.symbol for q in quotes)
+        scores = dict(zip(symbols, composite_scores(quotes, RankingWeights()), strict=True))
+        assert scores["BBB"] > scores["AAA"] > scores["CCC"] > scores["DDD"]
+
+
+class TestRankingWeights:
+    def test_a_negative_weight_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="w_spread must be a finite non-negative"):
+            RankingWeights(w_spread=-0.5)
+
+    def test_a_score_with_only_the_spread_penalty_is_refused(self) -> None:
+        """It would rank the least-liquid books first whenever spreads are missing."""
+        with pytest.raises(ValueError, match="at least one"):
+            RankingWeights(w_gap=0.0, w_turnover=0.0, w_rvol=0.0, w_spread=1.0)
+
+
+class TestCompositeSelection:
+    """End-to-end: the scanner ranks by composite score, not gap alone."""
+
+    def test_a_high_turnover_symbol_outranks_a_bigger_gap(self) -> None:
+        # A third anchor keeps the cross-section non-degenerate: with only two symbols the gap
+        # and turnover z-scores are exact mirrors (±1) and always cancel to a tie.
+        board = (
+            _quote("BIGGAP", "1000", "1100", turnover=Decimal("10000000")),  # +10 %, 1cr
+            _quote("BIGLIQ", "1000", "1060", turnover=Decimal("500000000")),  # +6 %, 50cr
+            _quote("ANCHOR", "1000", "1010", turnover=Decimal("10000000")),  # +1 %, 1cr
+        )
+        master = {
+            "BIGGAP": _record("BIGGAP", "1"),
+            "BIGLIQ": _record("BIGLIQ", "2"),
+            "ANCHOR": _record("ANCHOR", "3"),
+        }
+
+        result = _scanner(quotes=board, master=master, size=2).select(
+            board, budget=Decimal("50000")
+        )
+
+        assert result.symbols == ("BIGLIQ", "BIGGAP")
+        assert result.selected[0].score > result.selected[1].score
+
+    def test_volume_evidence_moves_the_ranking(self) -> None:
+        board = (
+            _quote("NOVOL", "1000", "1080", volume=None),  # +8 %, no volume evidence
+            _quote("HIVOL", "1000", "1050", volume=Decimal("9000000")),  # +5 %, 9x mean vol
+            _quote("LOVOL", "1000", "1050", volume=Decimal("1000000")),
+        )
+        master = {s: _record(s, str(i)) for i, s in enumerate(("NOVOL", "HIVOL", "LOVOL"))}
+
+        result = _scanner(quotes=board, master=master, size=3).select(
+            board, budget=Decimal("50000")
+        )
+
+        assert result.symbols[0] == "HIVOL"
+
+    def test_the_candidate_carries_its_score(self) -> None:
+        result = _scanner().select(_BOARD, budget=Decimal("50000"))
+        assert all(isinstance(candidate.score, float) for candidate in result.selected)
+        scores = [candidate.score for candidate in result.selected]
+        assert scores == sorted(scores, reverse=True)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Angel One fallback source
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _angel_row(
+    symbol: str,
+    ltp: object,
+    *,
+    net_change: object = None,
+    percent_change: object = None,
+    **extra: object,
+) -> dict[str, object]:
+    row: dict[str, object] = {"symbol": symbol, "lastTradedPrice": ltp}
+    if net_change is not None:
+        row["netChange"] = net_change
+    if percent_change is not None:
+        row["percentChange"] = percent_change
+    row.update(extra)
+    return row
+
+
+def _angel_payload(
+    *gainers: dict[str, object], losers: tuple[dict[str, object], ...] = ()
+) -> dict[str, object]:
+    return {"status": True, "data": {"gainers": list(gainers), "losers": list(losers)}}
+
+
+class TestParseAngelMovers:
+    def test_it_projects_gainers_and_losers_into_quotes(self) -> None:
+        payload = _angel_payload(
+            _angel_row("RELIANCE", 2900.5, net_change=115.5, volume=123456, turnover=350000000),
+            losers=(_angel_row("ZEEL", 120.0, net_change=-6.0),),
+        )
+        quotes = parse_angel_movers(payload)
+
+        assert tuple(q.symbol for q in quotes) == ("RELIANCE", "ZEEL")
+        reliance = quotes[0]
+        assert reliance.pre_open_price == Decimal("2900.5")
+        assert reliance.previous_close == Decimal("2785.00")
+        assert reliance.turnover == Decimal("350000000")
+        assert reliance.volume == Decimal("123456")
+        assert reliance.series == EQUITY_SERIES
+        assert quotes[1].previous_close == Decimal("126.00")
+
+    def test_the_previous_close_falls_back_to_percent_change(self) -> None:
+        quotes = parse_angel_movers(_angel_payload(_angel_row("X", 105.0, percent_change=5.0)))
+        assert quotes[0].previous_close == Decimal("100.00")
+
+    def test_the_eq_suffix_is_stripped_from_trading_symbols(self) -> None:
+        payload = _angel_payload(_angel_row("RELIANCE-EQ", 100.0, net_change=1.0))
+        quotes = parse_angel_movers(payload)
+        assert quotes[0].symbol == "RELIANCE"
+
+    def test_a_row_with_no_usable_previous_close_is_skipped(self) -> None:
+        """The gap denominator is the one number this module never guesses."""
+        payload = _angel_payload(
+            _angel_row("NOCHANGE", 100.0),  # neither netChange nor percentChange
+            _angel_row("GOOD", 200.0, net_change=10.0),
+        )
+        assert tuple(q.symbol for q in parse_angel_movers(payload)) == ("GOOD",)
+
+    def test_a_change_that_implies_a_non_positive_close_is_skipped(self) -> None:
+        # netChange = ltp - prev, so a "gain" larger than the price itself implies a negative
+        # previous close — an unusable gap denominator, so the row is dropped.
+        payload = _angel_payload(_angel_row("BLOWUP", 100.0, net_change=150.0))
+        assert parse_angel_movers(payload) == ()
+
+    def test_duplicate_symbols_are_taken_once(self) -> None:
+        payload = _angel_payload(
+            _angel_row("DUP", 100.0, net_change=1.0),
+            _angel_row("DUP", 101.0, net_change=2.0),
+        )
+        assert len(parse_angel_movers(payload)) == 1
+
+    @pytest.mark.parametrize("value", [None, "-", "junk", 0, -5])
+    def test_an_unusable_price_skips_the_row(self, value: object) -> None:
+        assert parse_angel_movers(_angel_payload(_angel_row("X", value, net_change=1.0))) == ()
+
+    @pytest.mark.parametrize("payload", [[], "text", {"status": False}, {"data": []}])
+    def test_a_body_we_cannot_read_is_a_failed_scan_not_an_empty_board(
+        self, payload: object
+    ) -> None:
+        with pytest.raises(PreOpenFetchError):
+            parse_angel_movers(payload)
+
+
+@pytest.mark.asyncio
+class TestAngelMoversSource:
+    """Exercised against a mock transport. Never against apiconnect.angelone.in."""
+
+    _HEADERS: dict[str, str] = {"Authorization": "Bearer jwt", "x-api-key": "key"}
+
+    @staticmethod
+    def _client(handler: Any) -> Any:
+        def factory() -> httpx.AsyncClient:
+            return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+        return factory
+
+    async def test_it_posts_the_screener_and_projects_quotes(self) -> None:
+        seen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            return httpx.Response(
+                200, json=_angel_payload(_angel_row("AAA", 110.0, net_change=10.0))
+            )
+
+        source = AngelMoversSource(headers=self._HEADERS, client_factory=self._client(handler))
+        quotes = await source.fetch()
+
+        assert tuple(q.symbol for q in quotes) == ("AAA",)
+        assert len(seen) == 1
+        assert seen[0].method == "POST"
+        assert seen[0].url.path == "/rest/secure/angelbroking/marketData/v1/gainersLosers"
+        assert seen[0].headers["Authorization"] == "Bearer jwt"
+        assert json.loads(seen[0].content) == {"exchange": "NSE", "duration": "1"}
+
+    async def test_the_header_provider_resolves_at_fetch_time(self) -> None:
+        calls = {"n": 0}
+
+        def provider() -> dict[str, str]:
+            calls["n"] += 1
+            return {"Authorization": "Bearer late-jwt"}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.headers["Authorization"] == "Bearer late-jwt"
+            return httpx.Response(200, json=_angel_payload())
+
+        source = AngelMoversSource(header_provider=provider, client_factory=self._client(handler))
+        assert calls["n"] == 0, "headers must not be resolved at construction"
+        await source.fetch()
+        assert calls["n"] == 1
+
+    async def test_an_unauthenticated_provider_is_a_fetch_error(self) -> None:
+        def provider() -> dict[str, str]:
+            raise PreOpenFetchError("no cached session")
+
+        factory = self._client(lambda r: httpx.Response(200))
+        source = AngelMoversSource(header_provider=provider, client_factory=factory)
+        with pytest.raises(PreOpenFetchError, match="no cached session"):
+            await source.fetch()
+
+    @pytest.mark.parametrize("status", [401, 403, 429, 500])
+    async def test_an_http_error_becomes_a_fetch_error(self, status: int) -> None:
+        source = AngelMoversSource(
+            headers=self._HEADERS,
+            client_factory=self._client(lambda r: httpx.Response(status, text="denied")),
+        )
+        with pytest.raises(PreOpenFetchError, match="Angel movers fetch failed"):
+            await source.fetch()
+
+    async def test_a_non_json_body_becomes_a_fetch_error(self) -> None:
+        source = AngelMoversSource(
+            headers=self._HEADERS,
+            client_factory=self._client(lambda r: httpx.Response(200, text="<html>nope</html>")),
+        )
+        with pytest.raises(PreOpenFetchError, match="not JSON"):
+            await source.fetch()
+
+
+def test_angel_movers_construction_without_any_headers_is_refused() -> None:
+    with pytest.raises(ValueError, match="authenticated endpoint"):
+        AngelMoversSource()
+
+
+class TestAngelAuthHeaders:
+    def test_it_carries_every_header_the_waf_and_api_require(self) -> None:
+        from tachyon.strategy.scanner import angel_auth_headers
+
+        headers = angel_auth_headers(
+            api_key="key", client_id="client", jwt_token="jwt", feed_token="feed"
+        )
+        assert headers["Authorization"] == "Bearer jwt"
+        assert headers["x-api-key"] == "key"
+        assert headers["x-client-code"] == "client"
+        assert headers["x-feed-token"] == "feed"
+        assert headers["X-UserKey"] == "key"
+        # Loopback in the IP headers is a known WAF rejection — never emit it.
+        assert not headers["X-ClientLocalIP"].startswith("127.")
+        assert not headers["X-ClientPublicIP"].startswith("127.")
+
+
+@pytest.mark.asyncio
+class TestDualSourcePreOpen:
+    """Primary first; the secondary is a degradation path, never a blend."""
+
+    async def test_a_healthy_primary_is_used_alone(self) -> None:
+        primary = _StaticSource(_BOARD)
+        secondary = _StaticSource((_quote("FALLBACK", "100", "150"),))
+        dual = DualSourcePreOpen(primary, secondary)
+
+        quotes = await dual.fetch()
+
+        assert quotes == _BOARD
+        assert dual.last_used == "primary"
+        assert secondary.calls == 0
+
+    async def test_a_failed_primary_falls_back_to_the_secondary(self) -> None:
+        fallback = (_quote("FALLBACK", "100", "150"),)
+        dual = DualSourcePreOpen(
+            _StaticSource(error=PreOpenFetchError("NSE blocked")), _StaticSource(fallback)
+        )
+
+        quotes = await dual.fetch()
+
+        assert quotes == fallback
+        assert dual.last_used == "secondary"
+
+    async def test_both_sources_failing_reports_both_causes(self) -> None:
+        dual = DualSourcePreOpen(
+            _StaticSource(error=PreOpenFetchError("NSE blocked")),
+            _StaticSource(error=PreOpenFetchError("Angel unauthenticated")),
+        )
+
+        with pytest.raises(PreOpenFetchError, match="NSE blocked") as excinfo:
+            await dual.fetch()
+        assert "Angel unauthenticated" in str(excinfo.value)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Intraday rotation
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _clock_at(hour: int, minute: int) -> ManualClock:
+    return ManualClock(wall=datetime(2026, 8, 28, hour, minute, tzinfo=IST))
+
+
+class TestRotationScheduler:
+    def test_the_default_slots_are_the_documented_ones(self) -> None:
+        assert DEFAULT_ROTATION_TIMES == (time(9, 30), time(11, 30), time(13, 30))
+        assert RotationScheduler(clock=_clock_at(8, 0)).times == DEFAULT_ROTATION_TIMES
+
+    def test_times_are_normalised_to_sorted_order(self) -> None:
+        scheduler = RotationScheduler([time(13, 30), time(9, 30)], clock=_clock_at(8, 0))
+        assert scheduler.times == (time(9, 30), time(13, 30))
+
+    def test_an_empty_schedule_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="at least one rotation time"):
+            RotationScheduler((), clock=_clock_at(8, 0))
+
+    def test_next_fire_rolls_through_the_day(self) -> None:
+        scheduler = RotationScheduler(clock=_clock_at(8, 0))
+        assert scheduler.next_fire(ist_at(scheduler.next_fire().date(), time(10, 0))) == ist_at(
+            datetime(2026, 8, 28, tzinfo=IST).date(), time(11, 30)
+        )
+
+    def test_next_fire_rolls_to_tomorrow_after_the_last_slot(self) -> None:
+        scheduler = RotationScheduler(clock=_clock_at(8, 0))
+        after = datetime(2026, 8, 28, 14, 0, tzinfo=IST)
+        assert scheduler.next_fire(after) == datetime(2026, 8, 29, 9, 30, tzinfo=IST)
+
+    def test_a_slot_fires_exactly_once(self) -> None:
+        scheduler = RotationScheduler(clock=_clock_at(9, 0))
+        assert scheduler.advance(datetime(2026, 8, 28, 9, 31, tzinfo=IST)) == datetime(
+            2026, 8, 28, 9, 30, tzinfo=IST
+        )
+        assert scheduler.advance(datetime(2026, 8, 28, 9, 32, tzinfo=IST)) is None
+        assert scheduler.last_fired == datetime(2026, 8, 28, 9, 30, tzinfo=IST)
+
+    def test_slots_before_the_arm_time_never_fire(self) -> None:
+        """A process booting at 12:00 waits for 13:30 — it does not burst-catch-up on
+        09:30 and 11:30."""
+        scheduler = RotationScheduler(clock=_clock_at(12, 0), arm_now=True)
+        assert scheduler.advance(datetime(2026, 8, 28, 12, 1, tzinfo=IST)) is None
+        assert scheduler.advance(datetime(2026, 8, 28, 13, 31, tzinfo=IST)) == datetime(
+            2026, 8, 28, 13, 30, tzinfo=IST
+        )
+
+    def test_a_blocked_loop_catches_up_on_the_latest_missed_slot_only(self) -> None:
+        scheduler = RotationScheduler(clock=_clock_at(9, 0))
+        assert scheduler.advance(datetime(2026, 8, 28, 9, 31, tzinfo=IST)) is not None
+        # The loop was blocked through 11:30 and 13:30; only the latest fires.
+        assert scheduler.advance(datetime(2026, 8, 28, 14, 0, tzinfo=IST)) == datetime(
+            2026, 8, 28, 13, 30, tzinfo=IST
+        )
+        assert scheduler.advance(datetime(2026, 8, 28, 14, 1, tzinfo=IST)) is None
+
+    def test_nothing_fires_before_the_first_slot(self) -> None:
+        scheduler = RotationScheduler(clock=_clock_at(8, 0))
+        assert scheduler.advance(datetime(2026, 8, 28, 9, 29, tzinfo=IST)) is None
+
+
+class TestPlanRotation:
+    """The pure swap planner: who may leave, who may enter, and in what order."""
+
+    _WATCHED: dict[str, float] = {"AAA": 2.0, "BBB": -float("inf"), "CCC": 0.5}
+
+    def test_a_symbol_no_longer_a_mover_is_the_first_to_go(self) -> None:
+        """BBB scored -inf: it fell out of the rescan entirely."""
+        plan = plan_rotation(
+            watched_scores=self._WATCHED,
+            rotatable={"AAA", "BBB", "CCC"},
+            candidates=[("NEW", 3.0)],
+        )
+        assert [(s.out_symbol, s.in_symbol) for s in plan.swaps] == [("BBB", "NEW")]
+
+    def test_a_symbol_with_an_open_position_is_never_rotated_out(self) -> None:
+        """The subscription carries the ticks the exit depends on."""
+        plan = plan_rotation(
+            watched_scores={"BBB": -float("inf")},
+            rotatable=set(),  # BBB is LONG — not rotatable
+            candidates=[("NEW", 3.0)],
+        )
+        assert plan.is_empty
+
+    def test_a_candidate_already_watched_is_not_swapped_in(self) -> None:
+        plan = plan_rotation(
+            watched_scores=self._WATCHED,
+            rotatable={"AAA", "BBB", "CCC"},
+            candidates=[("AAA", 5.0), ("NEW", 3.0)],
+        )
+        assert [(s.out_symbol, s.in_symbol) for s in plan.swaps] == [("BBB", "NEW")]
+
+    def test_the_incoming_symbol_must_clear_min_score(self) -> None:
+        plan = plan_rotation(
+            watched_scores=self._WATCHED,
+            rotatable={"AAA", "BBB", "CCC"},
+            candidates=[("WEAK", 0.5)],
+            min_score=1.0,
+        )
+        assert plan.is_empty
+
+    def test_the_incoming_symbol_must_strictly_beat_the_one_it_displaces(self) -> None:
+        """A swap between equals is churn, not rotation."""
+        plan = plan_rotation(
+            watched_scores={"AAA": 3.0},
+            rotatable={"AAA"},
+            candidates=[("TWIN", 3.0)],
+        )
+        assert plan.is_empty
+
+    def test_max_swaps_bounds_the_cycle(self) -> None:
+        plan = plan_rotation(
+            watched_scores={"A": -float("inf"), "B": -float("inf")},
+            rotatable={"A", "B"},
+            candidates=[("X", 3.0), ("Y", 2.0)],
+            max_swaps=1,
+        )
+        assert [(s.out_symbol, s.in_symbol) for s in plan.swaps] == [("A", "X")]
+
+    def test_swaps_pair_best_candidate_with_weakest_watched(self) -> None:
+        plan = plan_rotation(
+            watched_scores={"STRONG": 2.0, "WEAK": -1.0},
+            rotatable={"STRONG", "WEAK"},
+            candidates=[("BEST", 5.0), ("NEXT", 4.0)],
+            max_swaps=2,
+        )
+        assert [(s.out_symbol, s.in_symbol) for s in plan.swaps] == [
+            ("WEAK", "BEST"),
+            ("STRONG", "NEXT"),
+        ]
+
+    def test_ties_break_on_symbol_so_a_plan_is_reproducible(self) -> None:
+        plan = plan_rotation(
+            watched_scores={"ZZZ": 0.0, "AAA": 0.0},
+            rotatable={"ZZZ", "AAA"},
+            candidates=[("MMM", 2.0)],
+        )
+        assert plan.swaps[0].out_symbol == "AAA"
+
+    def test_a_non_positive_swap_budget_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="max_swaps must be at least 1"):
+            plan_rotation(
+                watched_scores=self._WATCHED, rotatable={"AAA"}, candidates=[], max_swaps=0
+            )
+
+
+class TestIntradayScanner:
+    """The live-rescan wrapper: dynamic floor and composite ranking by construction."""
+
+    @staticmethod
+    def _live_board() -> tuple[PreOpenQuote, ...]:
+        return tuple(
+            PreOpenQuote(
+                symbol=f"M{i:02d}",
+                previous_close=Decimal("1000"),
+                pre_open_price=Decimal(1000 + i * 10),
+                turnover=Decimal(i * 2_000_000),
+                series=EQUITY_SERIES,
+                volume=Decimal(i * 100_000),
+            )
+            for i in range(1, 13)
+        )
+
+    async def test_it_defaults_to_the_dynamic_floor(self) -> None:
+        board = self._live_board()
+        master = {q.symbol: _record(q.symbol, str(i)) for i, q in enumerate(board)}
+        source = _StaticSource(board)
+        scanner = IntradayScanner(source=source, resolver=_StaticResolver(master), size=12)
+
+        result = await scanner.scan(budget=Decimal("50000"))
+
+        assert source.calls == 1
+        assert scanner.scanner.turnover_percentile == DEFAULT_TURNOVER_PERCENTILE
+        assert result.floor_source in {"percentile", "backstop"}
+        assert result.selected[0].symbol == "M12"  # strongest mover and deepest liquidity
+
+    async def test_a_failed_scan_raises_so_the_caller_keeps_the_watchlist(self) -> None:
+        scanner = IntradayScanner(
+            source=_StaticSource(error=PreOpenFetchError("screener down")),
+            resolver=_StaticResolver({}),
+        )
+        with pytest.raises(PreOpenFetchError):
+            await scanner.scan(budget=Decimal("50000"))

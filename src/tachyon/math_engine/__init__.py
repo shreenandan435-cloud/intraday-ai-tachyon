@@ -21,6 +21,12 @@ OBI is the documented exception and returns ``0.0`` (balanced) for an empty book
 
 from __future__ import annotations
 
+from tachyon.math_engine.preseed import (
+    AggregatorHost,
+    bars_from_rows,
+    preseed_aggregator,
+    preseed_universe,
+)
 from tachyon.math_engine.warmup import (
     EngineNotWarmError,
     is_warm,
@@ -34,4 +40,14 @@ from tachyon.math_engine.warmup import (
 # intended API), but ``import tachyon.math_engine.warmup as m`` then binds the function too,
 # so ``m.require_warm`` raises AttributeError. Import submodule members directly —
 # ``from tachyon.math_engine.warmup import require_warm`` — and this never bites.
-__all__ = ["EngineNotWarmError", "is_warm", "require_warm", "reset_warm_state", "warmup"]
+__all__ = [
+    "AggregatorHost",
+    "EngineNotWarmError",
+    "bars_from_rows",
+    "is_warm",
+    "preseed_aggregator",
+    "preseed_universe",
+    "require_warm",
+    "reset_warm_state",
+    "warmup",
+]

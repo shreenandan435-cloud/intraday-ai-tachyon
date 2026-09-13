@@ -22,7 +22,7 @@ import logging
 import os
 import queue
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from decimal import Decimal
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Final, Literal
@@ -381,7 +381,9 @@ class TelegramAlerter:
                 return False
             self.stats.queued += 1
 
-        stamped = f"{_ICON.get(kind, '')} <b>{kind.value}</b> {now_ist(self._clock):%H:%M:%S}\n{text}"
+        stamped = (
+            f"{_ICON.get(kind, '')} <b>{kind.value}</b> {now_ist(self._clock):%H:%M:%S}\n{text}"
+        )
         if len(stamped) > MAX_MESSAGE_CHARS:
             stamped = stamped[:MAX_MESSAGE_CHARS - 1] + "…"
             self.stats.truncated += 1
@@ -395,7 +397,9 @@ class TelegramAlerter:
                 extra={
                     "depth": self._queue.qsize(),
                     "kind": kind.value,
-                    "impact": "this alert was dropped; a backlog this deep means something is looping",
+                    "impact": (
+                        "this alert was dropped; a backlog this deep means something is looping"
+                    ),
                 },
             )
             return False
@@ -501,7 +505,8 @@ class TelegramAlerter:
         )
         return self.send(
             f"<b>TRADING HALTED</b> — {_esc(reason)}\n"
-            f"Session: <b>{_money(total)}</b> (booked {_money(realised)}) vs limit Rs.{limit:,.2f}\n"
+            f"Session: <b>{_money(total)}</b> (booked {_money(realised)})"
+            f" vs limit Rs.{limit:,.2f}\n"
             f"{_esc(detail)}\n\n{guidance}{warning}",
             AlertType.KILL_SWITCH,
         )

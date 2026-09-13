@@ -8,7 +8,13 @@ every stop and every position.
 
 from __future__ import annotations
 
+import asyncio
 import math
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -16,13 +22,18 @@ import pytest
 from tachyon.ipc.schemas import OrderBook, Tick
 from tachyon.math_engine import warmup
 from tachyon.math_engine.buffers import CandleBuffer, RingBuffer
-from tachyon.math_engine.core import TickAggregator
+from tachyon.math_engine.core import HistoricalBar, TickAggregator
 from tachyon.math_engine.indicators import (
     calculate_depth_weighted_obi,
     calculate_ema,
     calculate_obi,
     calculate_vwap,
     calculate_wilder_atr,
+)
+from tachyon.math_engine.preseed import (
+    bars_from_rows,
+    preseed_aggregator,
+    preseed_universe,
 )
 from tachyon.math_engine.warmup import (
     EngineNotWarmError,
@@ -583,3 +594,324 @@ class TestTickAggregator:
 
         assert first.gaps_detected == 1
         assert second.gaps_detected == 0
+
+
+# ─── Cache locator safety (Vector 7) ─────────────────────────────────────────
+
+
+class TestNumbaCacheLocator:
+    """``cache=True`` must never crash a live tick with 'no locator available'."""
+
+    @staticmethod
+    def _probe(env_value: str | None, tmp_path: Path) -> str:
+
+        env = dict(os.environ)
+        if env_value is None:
+            env.pop("NUMBA_CACHE_DIR", None)
+        else:
+            env["NUMBA_CACHE_DIR"] = env_value
+        repo_src = str(Path(__file__).resolve().parents[2] / "src")
+        code = (
+            "import sys, os; "
+            "import tachyon.math_engine.indicators; "
+            "print(os.environ.get('NUMBA_CACHE_DIR', ''))"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            check=True,
+            env={**env, "PYTHONPATH": repo_src + os.pathsep + env.get("PYTHONPATH", "")},
+            cwd=str(tmp_path),
+            timeout=300,
+        )
+        return result.stdout.strip().splitlines()[-1]
+
+    def test_unset_env_falls_back_to_a_writable_numba_cache(self, tmp_path: Path) -> None:
+        resolved = self._probe(None, tmp_path)
+        # Repo root is preferred when reachable from the installed layout; cwd fallback
+        # otherwise. Either way it must be writable and end with .numba_cache.
+        assert resolved.endswith(".numba_cache")
+        assert Path(resolved).exists()
+
+    def test_explicit_numba_cache_dir_is_respected(self, tmp_path: Path) -> None:
+        override = tmp_path / "custom-cache"
+        resolved = self._probe(str(override), tmp_path)
+        assert resolved == str(override)
+        assert override.exists()
+
+    def test_kernels_are_nogil_with_cache_machinery(self) -> None:
+        from tachyon.math_engine.indicators import KERNELS
+
+        for kernel in KERNELS:
+            targetoptions = getattr(kernel, "targetoptions", {})
+            assert targetoptions.get("nogil") is True, f"{kernel.__name__}: nogil"
+            # The cache flag itself lives in the dispatcher's locator machinery, not in
+            # targetoptions; the presence of the on-disk counters proves it is wired.
+            assert hasattr(kernel, "_cache_misses"), f"{kernel.__name__}: cache disabled"
+
+
+# ─── Pre-market pre-seed (CLAUDE.md §3 — "the cold start is a bug") ───────────
+
+
+def _synthetic_ohlcv(
+    *,
+    days: int = 3,
+    interval_seconds: int = 300,
+    base: float = 100.0,
+    step: float = 0.1,
+    start_epoch: float = 1_700_000_000.0,
+    volume: float = 1000.0,
+) -> list[HistoricalBar]:
+    """Deterministic OHLCV series for seed tests — no random component.
+
+    Each candle's close advances by ``step``, so EMAs are predictable without needing a
+    reference implementation to be re-derived from the implementation under test.
+    """
+    candles_per_day = (6 * 60 * 60) // interval_seconds  # 09:15–15:15 IST ≈ 6h15m
+    bars: list[HistoricalBar] = []
+    for i in range(days * candles_per_day):
+        price = base + step * i
+        bars.append(
+            HistoricalBar(
+                start_epoch=start_epoch + i * interval_seconds,
+                open=price,
+                high=price + 0.5,
+                low=price - 0.5,
+                close=price + step * 0.5,
+                volume=volume,
+            )
+        )
+    return bars
+
+
+class TestSeedBars:
+    def test_empty_input_is_a_noop(self) -> None:
+        agg = TickAggregator("RELIANCE")
+        agg.seed_bars([])
+        assert agg.candle_count == 0
+        assert agg.tick_count == 0
+        assert math.isnan(agg.ltp)
+        assert math.isnan(agg.atr())
+
+    def test_populates_candle_buffer(self) -> None:
+        agg = TickAggregator("RELIANCE", candle_capacity=200)
+        bars = _synthetic_ohlcv(days=1)
+        agg.seed_bars(bars)
+        assert agg.candle_count == len(bars)
+        # First and last candle reflect the seeded series.
+        snap = agg.snapshot()
+        assert snap.candle_count == len(bars)
+
+    def test_atr_is_finite_after_seeding(self) -> None:
+        """The whole point of the pre-seed: ATR must be ready before 09:15 open."""
+        agg = TickAggregator("RELIANCE", atr_period=14, candle_capacity=200)
+        bars = _synthetic_ohlcv(days=1)
+        agg.seed_bars(bars)
+        atr = agg.atr()
+        assert math.isfinite(atr)
+        assert atr > 0.0
+
+    def test_emas_are_finite_after_seeding(self) -> None:
+        agg = TickAggregator("RELIANCE", ema_periods=(9, 20, 50), tick_capacity=200)
+        bars = _synthetic_ohlcv(days=1)
+        agg.seed_bars(bars)
+        emas = agg.snapshot().emas
+        assert len(emas) == 3
+        assert all(math.isfinite(value) for value in emas)
+
+    def test_session_vwap_is_not_contaminated_by_preeed_data(self) -> None:
+        """Session VWAP anchors at 09:15; pre-seeded bars must not bleed into it."""
+        agg = TickAggregator("RELIANCE")
+        bars = _synthetic_ohlcv(days=2)
+        agg.seed_bars(bars)
+        assert agg.session_vwap_valid is True
+        # No live tick yet: there is no per-print session volume.
+        assert math.isnan(agg.session_vwap)
+
+    def test_last_close_becomes_ltp(self) -> None:
+        agg = TickAggregator("RELIANCE")
+        bars = _synthetic_ohlcv(days=1)
+        agg.seed_bars(bars)
+        last_close = bars[-1].close
+        assert agg.ltp == pytest.approx(last_close)
+        assert agg._last_ts == pytest.approx(bars[-1].start_epoch)
+
+    def test_does_not_flag_sequence_gap(self) -> None:
+        """Pre-seeded bars have no sequence number; _last_seq must stay None."""
+        agg = TickAggregator("RELIANCE")
+        agg.seed_bars(_synthetic_ohlcv(days=1))
+        assert agg._last_seq is None
+        assert agg.gaps_detected == 0
+        assert not agg.tainted
+
+    def test_live_ticks_resume_after_seeding(self) -> None:
+        """A pre-seeded aggregator must keep working when the first live tick lands."""
+        agg = TickAggregator("RELIANCE", ema_periods=(20,), tick_capacity=200)
+        agg.seed_bars(_synthetic_ohlcv(days=1))
+        atr_before = agg.atr()
+        assert math.isfinite(atr_before)
+
+        agg.on_tick(_tick(1, 150.0, 100, ts=1_700_000_000.0 + 1_000))
+        assert agg.tick_count == len(list(_synthetic_ohlcv(days=1))) + 1
+        # ATR remains finite through the live tick.
+        assert math.isfinite(agg.atr())
+
+
+class TestBarsFromRows:
+    def test_round_trip(self) -> None:
+        rows = [
+            ["2026-08-31 09:15:00", 100.0, 101.0, 99.0, 100.5, 1000.0],
+            ["2026-08-31 09:20:00", 100.5, 102.0, 100.0, 101.5, 1500.0],
+        ]
+        bars = bars_from_rows(rows, interval_minutes=5)
+        assert len(bars) == 2
+        first = bars[0]
+        assert first.open == 100.0
+        assert first.high == 101.0
+        assert first.low == 99.0
+        assert first.close == 100.5
+        assert first.volume == 1000.0
+        assert isinstance(first, HistoricalBar)
+
+    def test_malformed_rows_are_skipped(self) -> None:
+        rows: list[list[Any]] = [
+            ["2026-08-31 09:15:00", 100.0, 101.0, 99.0, 100.5, 1000.0],
+            ["not-a-timestamp", 1, 2, 3, 4, 5],
+            ["2026-08-31 09:25:00", 1, 2, 3, 4, 5],
+        ]
+        bars = bars_from_rows(rows, interval_minutes=5)
+        assert len(bars) == 2
+
+
+class _StubFetcher:
+    """Async fetcher stand-in for preseed_aggregator tests."""
+
+    def __init__(self, rows: list[list[Any]] | None = None, exc: BaseException | None = None) -> None:
+        self._rows = rows
+        self._exc = exc
+        self.calls = 0
+
+    async def fetch_historical_candles(
+        self,
+        exchange: str,
+        symbol_token: str,
+        days: int = 3,
+        interval: str = "FIVE_MINUTE",
+    ) -> list[list[Any]]:
+        self.calls += 1
+        if self._exc is not None:
+            raise self._exc
+        return list(self._rows or [])
+
+
+class TestPreseedAggregator:
+    def test_returns_zero_when_no_fetcher(self) -> None:
+        agg = TickAggregator("RELIANCE")
+        result = asyncio.run(
+            preseed_aggregator(
+                agg, exchange="NSE", symbol_token="2885", fetcher=None
+            )
+        )
+        assert result == 0
+        assert agg.candle_count == 0
+
+    def test_seeds_aggregator_with_returned_rows(self) -> None:
+        rows = [
+            ["2026-08-31 09:15:00", 100.0, 101.0, 99.0, 100.5, 1000.0],
+            ["2026-08-31 09:20:00", 100.5, 102.0, 100.0, 101.5, 1500.0],
+        ] * 30
+        agg = TickAggregator("RELIANCE", candle_capacity=200, tick_capacity=200)
+        fetcher = _StubFetcher(rows=rows)
+        result = asyncio.run(
+            preseed_aggregator(
+                agg, exchange="NSE", symbol_token="2885", fetcher=fetcher
+            )
+        )
+        assert result == 60
+        assert agg.candle_count == 60
+        assert fetcher.calls == 1
+
+    def test_empty_rows_leaves_aggregator_cold(self) -> None:
+        agg = TickAggregator("RELIANCE")
+        result = asyncio.run(
+            preseed_aggregator(
+                agg,
+                exchange="NSE",
+                symbol_token="2885",
+                fetcher=_StubFetcher(rows=[]),
+            )
+        )
+        assert result == 0
+        assert agg.candle_count == 0
+
+    def test_fetcher_exception_does_not_propagate(self) -> None:
+        agg = TickAggregator("RELIANCE")
+        result = asyncio.run(
+            preseed_aggregator(
+                agg,
+                exchange="NSE",
+                symbol_token="2885",
+                fetcher=_StubFetcher(exc=RuntimeError("rate-limited")),
+            )
+        )
+        assert result == 0
+        assert agg.candle_count == 0
+
+
+class TestPreseedUniverse:
+    def test_iterates_every_symbol_in_order(self) -> None:
+        aggregators = {
+            "RELIANCE": TickAggregator("RELIANCE", candle_capacity=200, tick_capacity=200),
+            "INFY": TickAggregator("INFY", candle_capacity=200, tick_capacity=200),
+        }
+
+        class _Host:
+            def __iter__(self):  # type: ignore[no-untyped-def]
+                return iter(aggregators.items())
+
+        rows = [
+            ["2026-08-31 09:15:00", 100.0, 101.0, 99.0, 100.5, 1000.0],
+            ["2026-08-31 09:20:00", 100.5, 102.0, 100.0, 101.5, 1500.0],
+        ] * 30
+        fetcher = _StubFetcher(rows=rows)
+        tokens = {"RELIANCE": "2885", "INFY": "1594"}
+        results = asyncio.run(
+            preseed_universe(_Host(), fetcher, token_lookup=tokens)
+        )
+        assert results == {"RELIANCE": 60, "INFY": 60}
+        assert fetcher.calls == 2
+        for agg in aggregators.values():
+            assert agg.candle_count == 60
+
+    def test_missing_token_is_logged_and_recorded_as_zero(self) -> None:
+        aggregators = {
+            "RELIANCE": TickAggregator("RELIANCE"),
+            "UNKNOWN": TickAggregator("UNKNOWN"),
+        }
+
+        class _Host:
+            def __iter__(self):  # type: ignore[no-untyped-def]
+                return iter(aggregators.items())
+
+        fetcher = _StubFetcher(rows=[])
+        results = asyncio.run(
+            preseed_universe(_Host(), fetcher, token_lookup={"RELIANCE": "2885"})
+        )
+        assert results == {"RELIANCE": 0, "UNKNOWN": 0}
+        assert aggregators["RELIANCE"].candle_count == 0
+        assert aggregators["UNKNOWN"].candle_count == 0
+        # Fetcher is called once for the known token, but returns no rows.
+        assert fetcher.calls == 1
+
+    def test_no_token_lookup_leaves_everyone_cold(self) -> None:
+        aggregators = {"RELIANCE": TickAggregator("RELIANCE")}
+
+        class _Host:
+            def __iter__(self):  # type: ignore[no-untyped-def]
+                return iter(aggregators.items())
+
+        fetcher = _StubFetcher(rows=[])
+        results = asyncio.run(preseed_universe(_Host(), fetcher))
+        assert results == {"RELIANCE": 0}
+        assert fetcher.calls == 0

@@ -36,7 +36,7 @@ from tachyon.execution.reconciliation import (
     DEFAULT_POLL_SECONDS,
     OrderBookPoller,
 )
-from tachyon.main import IngestorSupervisor, Orchestrator, confirm_live
+from tachyon.main import IngestorSupervisor, Orchestrator, SidecarSupervisor, confirm_live
 from tachyon.persistence.journal import JsonlJournal
 from tachyon.ui.postback import OrderStatusListener, watchlist_resolver
 
@@ -578,6 +578,20 @@ class TestOrchestrator:
         await asyncio.wait_for(orchestrator.run(), timeout=10.0)
         assert "shutdown" in brain.events
 
+    async def test_initialize_is_idempotent_for_early_wiring(self) -> None:
+        """``_main`` initializes the orchestrator before spawning the ExecutionRouter (so the
+        router can share the Brain's risk engine), and ``run()`` then calls ``_initialize()``
+        again. The second call must be a no-op — re-running it would rebuild telemetry and the
+        paper engine under an already-booting process."""
+        orchestrator, _brain, _supervisor = self._build(run_forever=False)
+        await orchestrator._initialize()
+        assert orchestrator._initialized
+        telemetry_first = orchestrator._telemetry
+        engine_first = orchestrator._paper_engine
+        await orchestrator._initialize()
+        assert orchestrator._telemetry is telemetry_first
+        assert orchestrator._paper_engine is engine_first
+
 
 class TestIngestorSupervisor:
     async def test_a_disabled_supervisor_spawns_nothing(self) -> None:
@@ -619,6 +633,118 @@ class TestIngestorSupervisor:
         assert not supervisor.is_running
 
 
+class TestZmqPortMap:
+    """Every ZMQ endpoint has exactly one binder; a shared port is EADDRINUSE at best and
+    silent message theft at worst. The sidecar once defaulted its control REP to 5555 — the
+    tick spine the Ingestor PUB-binds — and contested it at startup."""
+
+    def test_every_endpoint_has_its_own_port(self) -> None:
+        s = _settings()
+        endpoints = [
+            s.zmq_tick_endpoint,
+            s.zmq_state_endpoint,
+            s.zmq_sentinel_endpoint,
+            s.zmq_sidecar_control_endpoint,
+            s.zmq_action_endpoint,
+        ]
+        ports = [e.rsplit(":", 1)[-1] for e in endpoints]
+        assert len(set(ports)) == len(ports), f"port collision in {endpoints}"
+
+    def test_sidecar_control_is_not_the_tick_spine(self) -> None:
+        s = _settings()
+        assert s.zmq_sidecar_control_endpoint != s.zmq_tick_endpoint
+        assert s.zmq_sidecar_control_endpoint != s.zmq_state_endpoint
+
+    def test_control_default_matches_hot_swap_caller(self) -> None:
+        """rl.export.signal_hot_swap REQ-connects to DEFAULT_CONTROL_ENDPOINT; if the two
+        drift, RELOAD_ENGINE dies on a port nobody listens on — silently."""
+        from tachyon.rl.export import DEFAULT_CONTROL_ENDPOINT
+
+        assert _settings().zmq_sidecar_control_endpoint == DEFAULT_CONTROL_ENDPOINT
+
+
+class TestSidecarSupervisor:
+    async def test_a_disabled_supervisor_spawns_nothing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def explode(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("a disabled supervisor must not spawn")
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", explode)
+        supervisor = SidecarSupervisor(enabled=False)
+        await asyncio.wait_for(supervisor.run(), timeout=5.0)
+        assert supervisor.stats["starts"] == 0
+
+    async def test_a_missing_executable_is_reported_not_raised(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import tachyon.main as main_mod
+
+        monkeypatch.setattr(main_mod, "SIDECAR_EXECUTABLE", tmp_path / "nope.exe")
+        supervisor = SidecarSupervisor(enabled=True, settings=_settings())
+        await asyncio.wait_for(supervisor.run(), timeout=5.0)
+        assert supervisor.stats["starts"] == 0
+
+    async def test_spawn_passes_both_endpoints_from_settings(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The topology is decided by the settings port map, never by the sidecar's
+        compiled-in defaults: both --endpoint and --actions-endpoint must be passed, and
+        they must be the configured values."""
+        import tachyon.main as main_mod
+
+        exe = tmp_path / "tachyon_sidecar.exe"
+        exe.write_bytes(b"MZ")
+        monkeypatch.setattr(main_mod, "SIDECAR_EXECUTABLE", exe)
+        monkeypatch.setattr(main_mod, "SIDECAR_ENGINE_PLAN", tmp_path / "engine.plan")
+
+        settings = _settings(
+            zmq_sidecar_control_endpoint="tcp://127.0.0.1:5901",
+            zmq_action_endpoint="tcp://127.0.0.1:5902",
+        )
+        supervisor = SidecarSupervisor(enabled=True, settings=settings)
+        spawned: list[tuple[Any, ...]] = []
+
+        class _FakeProcess:
+            pid = 4242
+            returncode: int | None = None
+
+            async def wait(self) -> int:
+                await supervisor._stopping.wait()
+                self.returncode = 0
+                return 0
+
+            def terminate(self) -> None:
+                pass
+
+            def kill(self) -> None:
+                pass
+
+        async def fake_exec(*args: Any, **_kwargs: Any) -> _FakeProcess:
+            spawned.append(args)
+            return _FakeProcess()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+        task = asyncio.create_task(supervisor.run())
+
+        async def wait_for_spawn() -> None:
+            while not spawned:
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(wait_for_spawn(), timeout=5.0)
+        await supervisor.stop()
+        await asyncio.wait_for(task, timeout=5.0)
+
+        args = [str(a) for a in spawned[0]]
+        assert "--endpoint" in args
+        assert args[args.index("--endpoint") + 1] == "tcp://127.0.0.1:5901"
+        assert "--actions-endpoint" in args
+        assert args[args.index("--actions-endpoint") + 1] == "tcp://127.0.0.1:5902"
+        # The two sidecar sockets must never share a port with each other either.
+        assert args[args.index("--endpoint") + 1] != args[args.index("--actions-endpoint") + 1]
+
+
 class TestLiveConfirmation:
     def test_paper_needs_no_confirmation(self) -> None:
         assert confirm_live(_settings(trading_mode=TradingMode.PAPER))
@@ -654,7 +780,10 @@ class TestLiveConfirmation:
             smartapi_password="p",
             smartapi_totp_secret="t",
         )
-        assert confirm_live(settings) is (answer.strip() == "LIVE")
+        # Exact word only: "LIVE " with a stray space is a slip, not a confirmation
+        # (confirm_live deliberately does not strip). A headless run refuses before the
+        # prompt is reached; these parametrisations exercise the tty path.
+        assert confirm_live(settings) is (answer == "LIVE")
 
     async def test_a_configuration_fault_is_not_retried(self, tmp_path: Path) -> None:
         """Exit 2 means bad credentials or an empty watchlist. Retrying cannot fix that."""

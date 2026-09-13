@@ -16,19 +16,30 @@ Sequence
 
 Configuration
 -------------
-All configuration via environment variables or .env file:
+All configuration via environment variables or .env file. Budget resolution order
+(first hit wins; an unparseable value logs a warning and falls through):
 
-- ``PAPER_TRADING_BUDGET_INR`` — Session budget (default: 100000)
-- ``PAPER_MAX_DAILY_DRAWDOWN_PCT`` — Max daily drawdown % (default: 2.0)
-- ``PAPER_PER_TRADE_RISK_PCT`` — Per-trade risk % (default: 1.0)
-- ``SCAN_SYMBOLS`` — Number of symbols to select (default: 4)
-- ``TELEGRAM_BOT_TOKEN`` / ``TELEGRAM_CHAT_ID`` — Alert credentials
+1. ``--budget`` CLI flag
+2. ``TACHYON_BUDGET``
+3. ``PAPER_TRADING_BUDGET_INR``
+4. ``settings.capital.session_budget_inr``
+5. Default ₹100,000
+
+Also: ``PAPER_MAX_DAILY_DRAWDOWN_PCT`` (2.0), ``PAPER_PER_TRADE_RISK_PCT`` (1.0),
+``SCAN_SYMBOLS`` (4), ``TELEGRAM_BOT_TOKEN`` / ``TELEGRAM_CHAT_ID``.
 
 Flags
 -----
-``--dry-run``     Scan, render, validate, print — write nothing, launch nothing.
-``--no-launch``   Do the writes, stop before the orchestrator.
-``--skip-scan``   Set the budget only; leave the watchlist alone.
+``--budget N``     Session budget in rupees — overrides every env/default.
+``--scan-symbols`` Number of pre-open candidates to select.
+``--yes``          Headless handshake: sets ``TACHYON_ASSUME_YES=1`` for any downstream
+                   confirmation gate (e.g. LIVE mode) so nothing blocks on stdin.
+``--dry-run``      Scan, render, validate, print — write nothing, launch nothing.
+``--no-launch``    Do the writes, stop before the orchestrator.
+``--skip-scan``    Set the budget only; leave the watchlist alone.
+
+When stdin is not a TTY (Task Scheduler / systemd), the non-interactive handshake is set
+automatically and announced.
 """
 
 from __future__ import annotations
@@ -39,6 +50,7 @@ import socket
 import sys
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from typing import Any, Final
 from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -62,14 +74,19 @@ from tachyon.ingestion.instruments import InstrumentMaster  # noqa: E402
 from tachyon.risk.budget import SessionBudget  # noqa: E402
 from tachyon.strategy.scanner import (  # noqa: E402
     DEFAULT_SELECTION_SIZE,
+    DEFAULT_TURNOVER_PERCENTILE,
     INTRADAY_LEVERAGE,
     NSE_PRE_OPEN_URL,
     PENNY_PRICE_FLOOR_INR,
+    AngelMoversSource,
+    DualSourcePreOpen,
     MasterSymbolResolver,
     NsePreOpenSource,
     PreMarketScanner,
     PreOpenFetchError,
+    PreOpenSource,
     ScanResult,
+    cached_angel_headers,
 )
 
 RULE = "=" * 78
@@ -102,15 +119,95 @@ def _get_env_budget(settings: Settings) -> Decimal:
     return Decimal("100000")  # Default ₹1,00,000
 
 
-def _get_env_scan_symbols() -> int:
-    """Load scan symbols count from environment."""
+#: Budget resolution chain. First non-empty source wins; unparseable values are skipped
+#: with a loud warning rather than silently falling through.
+_BUDGET_SOURCES: Final[tuple[tuple[str, str], ...]] = (
+    ("cli", "--budget"),
+    ("TACHYON_BUDGET", "env"),
+    ("PAPER_TRADING_BUDGET_INR", "env"),
+)
+
+
+def _resolve_scan_symbols(cli_value: int | None, *, log: Any = None) -> int:
+    """CLI ``--scan-symbols`` > env ``SCAN_SYMBOLS`` > library default."""
+    if cli_value is not None and cli_value > 0:
+        return cli_value
     env_symbols = os.environ.get("SCAN_SYMBOLS")
     if env_symbols:
         try:
-            return int(env_symbols)
+            value = int(env_symbols)
+            if value > 0:
+                return value
         except ValueError:
             pass
+        if log is not None:
+            log.warning("boot.scan_symbols_invalid", raw=env_symbols)
     return DEFAULT_SELECTION_SIZE
+
+
+def resolve_budget(
+    settings: Settings,
+    *,
+    cli_raw: str | None = None,
+    log: Any | None = None,
+) -> tuple[Decimal, str]:
+    """Resolve the session budget through the documented precedence chain.
+
+    Returns:
+        ``(budget, source_label)`` where the label names which layer supplied it —
+        operators must be able to tell an env default from a deliberate CLI override.
+    """
+    attempts: list[tuple[str, str, str]] = []
+    if cli_raw is not None:
+        attempts.append(("--budget", cli_raw, "cli"))
+    for env_name, kind in _BUDGET_SOURCES[1:]:
+        value = os.environ.get(env_name)
+        if value is not None:
+            attempts.append((f"env:{env_name}", value, kind))
+
+    warned: set[str] = set()
+    for source, raw, _kind in attempts:
+        parsed = parse_budget(raw)
+        if parsed is not None:
+            return parsed, source
+        if source not in warned:
+            warned.add(source)
+            if log is not None:
+                log.warning(
+                    "boot.budget_ignored",
+                    source=source,
+                    raw=repr(raw),
+                    reason="unparseable or non-positive",
+                )
+
+    if settings.capital.session_budget_inr > 0:
+        return settings.capital.session_budget_inr, "settings.yaml"
+    return Decimal("100000"), "default"
+
+
+def _apply_non_interactive(args: argparse.Namespace, *, log: Any | None = None) -> bool:
+    """Set the downstream handshake when booting without a human at stdin.
+
+    Returns True when non-interactive mode is engaged. The orchestrator's
+    :func:`tachyon.main.confirm_live` honours ``TACHYON_ASSUME_YES``; paper mode never
+    asks anyway, so this only bites on deliberate LIVE boots under Task Scheduler.
+    """
+    headless = sys.stdin is None or not sys.stdin.isatty()
+    engaged = args.yes or headless
+    if headless:
+        os.environ.setdefault("TACHYON_NON_INTERACTIVE", "1")
+    if args.yes:
+        os.environ["TACHYON_ASSUME_YES"] = "1"
+        os.environ["TACHYON_NON_INTERACTIVE"] = "1"
+        if log is not None:
+            log.warning(
+                "boot.non_interactive_confirmed",
+                trigger="--yes",
+                impact="any downstream confirmation gate (e.g. LIVE) is auto-accepted",
+            )
+    elif headless and log is not None:
+        log.info("boot.headless_detected", action="stdin prompts disabled for this session")
+    return engaged
 
 
 def _endpoint_is_bound(endpoint: str, *, timeout: float = 0.3) -> bool:
@@ -162,7 +259,7 @@ def parse_budget(raw: str) -> Decimal | None:
     text = raw.strip().replace(",", "").replace("_", "").lstrip("₹").strip()
     for prefix in ("rs.", "inr", "rs"):
         if text.lower().startswith(prefix):
-            text = text[len(prefix):].strip()
+            text = text[len(prefix) :].strip()
             break
     if not text:
         return None
@@ -184,7 +281,7 @@ def describe_budget(settings: Settings, budget: Decimal) -> str:
     )
     lines = [
         RULE,
-        "  PAPER TRADING BUDGET — HEADLESS MODE",
+        "  THIS IS A RISK BUDGET, NOT SPENDING MONEY.",
         "  CLAUDE.md 1.3 derives this session's hard limits from it:",
         "",
         f"    session_budget_inr        Rs.{budget:,f}",
@@ -225,11 +322,18 @@ def describe_budget(settings: Settings, budget: Decimal) -> str:
     return "\n".join(lines)
 
 
-async def run_scan(budget: Decimal, *, size: int) -> ScanResult:
+async def run_scan(settings: Settings, budget: Decimal, *, size: int) -> ScanResult:
     """Refresh the scrip master, fetch the pre-open board, and select.
 
+    Universe ingestion is dual-source: NSE's pre-open document is primary, and Angel One's
+    gainers/losers screener is the fallback — used only when NSE fails, never blended (see
+    :class:`~tachyon.strategy.scanner.DualSourcePreOpen`). The liquidity floor is dynamic:
+    the top-decile percentile of published pre-open turnovers, bounded below by the absolute
+    backstop, instead of a rigid rupee constant.
+
     Raises:
-        PreOpenFetchError: the board was unavailable. Callers must leave the watchlist alone.
+        PreOpenFetchError: the board was unavailable from every source. Callers must leave
+            the watchlist alone.
     """
     master = InstrumentMaster()
     try:
@@ -240,7 +344,27 @@ async def run_scan(budget: Decimal, *, size: int) -> ScanResult:
     resolver = MasterSymbolResolver.from_master(master)
     _say(f"  [ ok ] scrip master: {len(resolver)} NSE cash-equity instruments")
 
-    scanner = PreMarketScanner(source=NsePreOpenSource(), resolver=resolver, size=size)
+    primary: PreOpenSource = NsePreOpenSource()
+    source: PreOpenSource = primary
+    api_key = settings.smartapi_api_key.get_secret_value()
+    client_code = settings.smartapi_client_code.get_secret_value()
+    if api_key and client_code:
+        source = DualSourcePreOpen(
+            primary,
+            AngelMoversSource(
+                header_provider=cached_angel_headers(api_key=api_key, client_id=client_code)
+            ),
+        )
+        _say("  [ ok ] universe source: NSE pre-open (primary) + Angel movers (fallback)")
+    else:
+        _say("  [ ok ] universe source: NSE pre-open (no SmartAPI credentials for fallback)")
+
+    scanner = PreMarketScanner(
+        source=source,
+        resolver=resolver,
+        size=size,
+        turnover_percentile=DEFAULT_TURNOVER_PERCENTILE,
+    )
     return await scanner.scan(budget=budget)
 
 
@@ -251,7 +375,7 @@ def report_scan(result: ScanResult) -> None:
     _say(f"  PRE-MARKET SCAN — {result.considered} symbols on the board")
     _say(
         f"  filters: series {result.required_series} | price >= Rs.{PENNY_PRICE_FLOOR_INR} | "
-        f"pre-open turnover >= Rs.{result.min_turnover:,f}"
+        f"pre-open turnover >= Rs.{result.min_turnover:,f} ({result.floor_source})"
     )
     _say(RULE)
     _say(
@@ -275,7 +399,24 @@ def report_scan(result: ScanResult) -> None:
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="boot_tachyon",
-        description="Headless paper trading boot — budget from env, scan, then launch.",
+        description="Headless paper trading boot — budget from CLI/env, scan, then launch.",
+    )
+    parser.add_argument(
+        "--budget",
+        type=str,
+        default=None,
+        help="session budget in rupees; overrides TACHYON_BUDGET / env / yaml",
+    )
+    parser.add_argument(
+        "--scan-symbols",
+        type=int,
+        default=None,
+        help="number of pre-open candidates to select (default 4)",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="non-interactive: auto-accept downstream confirmation gates",
     )
     parser.add_argument("--dry-run", action="store_true", help="write nothing, launch nothing")
     parser.add_argument("--no-launch", action="store_true", help="write, but do not boot")
@@ -305,10 +446,14 @@ def main(argv: list[str] | None = None) -> int:
     _configure(settings)
     log = get_logger("boot_tachyon")
 
+    non_interactive = _apply_non_interactive(args, log=log)
+
     _say()
     _say(RULE)
     _say("  I N T R A D A Y   A I   T A C H Y O N   —   headless paper boot")
     _say(f"  {now_ist().isoformat(timespec='seconds')}   mode={settings.trading_mode.value}")
+    if non_interactive:
+        _say("  stdin: NOT interactive — prompts disabled, TACHYON_ASSUME_YES honoured")
     _say(RULE)
 
     for refusal in (guard_no_live_session(settings), guard_not_locked()):
@@ -316,9 +461,11 @@ def main(argv: list[str] | None = None) -> int:
             _say(f"\n  [REFUSED] {refusal}\n")
             return EXIT_REFUSED
 
-    # Load budget from environment (no interactive prompt)
-    budget = _get_env_budget(settings)
-    scan_symbols = _get_env_scan_symbols()
+    # Budget precedence: --budget > TACHYON_BUDGET > PAPER_TRADING_BUDGET_INR > yaml > default.
+    budget, budget_source = resolve_budget(settings, cli_raw=args.budget, log=log)
+    scan_symbols = _resolve_scan_symbols(args.scan_symbols, log=log)
+    _say(f"\n  [ ok ] budget Rs.{budget:,f} (source: {budget_source})")
+    _say(f"  [ ok ] scan symbols: {scan_symbols}")
 
     _say()
     _say(describe_budget(settings, budget))
@@ -327,7 +474,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.skip_scan:
         _say("\n  [ .. ] scanning the NSE pre-open board (one request, whole universe)")
         try:
-            result = eventloop.run(run_scan(budget, size=scan_symbols))
+            result = eventloop.run(run_scan(settings, budget, size=scan_symbols))
         except (PreOpenFetchError, ValueError) as exc:
             _say(f"  [warn] pre-market scan failed: {exc}")
             _say("         the existing watchlist is left exactly as it is.")
@@ -341,8 +488,9 @@ def main(argv: list[str] | None = None) -> int:
     provenance = ""
     if result is not None:
         provenance = (
-            f"top {len(result.selected)} by |gap%| from {NSE_PRE_OPEN_URL} "
-            f"({result.considered} considered, budget Rs.{budget})"
+            f"top {len(result.selected)} by composite score from {NSE_PRE_OPEN_URL} "
+            f"({result.considered} considered, budget Rs.{budget}, "
+            f"turnover floor Rs.{result.min_turnover:,f} [{result.floor_source}])"
         )
 
     try:

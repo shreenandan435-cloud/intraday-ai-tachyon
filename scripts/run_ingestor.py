@@ -17,10 +17,43 @@ and keeps running when the Brain is down.
 from __future__ import annotations
 
 import asyncio
+import os
 import signal
 import sys
+import threading
 from pathlib import Path
 
+
+# Global thread exception trap – ensures background SDK threads that raise
+# unhandled exceptions do not abort the entire process. Logs the error and
+# swallows it so the main loop can continue graceful shutdown.
+def _thread_excepthook(args):
+    log = get_logger("run_ingestor")
+    log.error(
+        "thread.exception",
+        thread=args.thread.name,
+        exc_type=type(args.exc_value).__name__,
+        exc_msg=str(args.exc_value),
+    )
+
+threading.excepthook = _thread_excepthook
+
+# The excepthook MUST be installed before any import that can spawn a background
+# thread (zmq, SmartApi) — hence the deferred imports (noqa: E402).
+import atexit  # noqa: E402
+
+import zmq  # noqa: E402
+
+
+def _shutdown_zmq_context():
+    try:
+        ctx = zmq.Context.instance()
+        # Destroy all sockets instantly; linger=0 forces immediate unbind.
+        ctx.destroy(linger=0)
+    except Exception:
+        pass
+
+atexit.register(_shutdown_zmq_context)
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from tachyon.core import eventloop  # noqa: E402
@@ -100,18 +133,36 @@ async def _verify_instruments(settings: Settings) -> bool:
 def _install_signal_handlers(service: IngestionService) -> None:
     """Request a graceful shutdown on SIGINT/SIGTERM (CLAUDE.md §9).
 
-    ``loop.add_signal_handler`` is POSIX-only, so fall back to ``signal.signal`` on Windows.
+    ``loop.add_signal_handler`` is POSIX-only, so fall back to ``signal.signal`` on Windows
+    (Task Scheduler never delivers SIGTERM there — it hard-kills — but CI and consoles do
+    deliver SIGINT via Ctrl-C, and the fallback keeps that path clean).
+
+    Two-stage: the first signal starts :meth:`IngestionService.stop` (flush telemetry,
+    LINGER-0 socket close); a **second** signal means the operator wants out *now* — the
+    process exits immediately rather than wedging on a stuck shutdown.
     """
+    log = get_logger("run_ingestor")
     loop = asyncio.get_running_loop()
+    stop_started = False
 
     def request_stop() -> None:
+        nonlocal stop_started
+        if stop_started:
+            log.critical(
+                "ingestor.second_signal",
+                action="forcing immediate exit — graceful stop already in progress",
+            )
+            # os._exit skips atexit/flushes deliberately: a hung teardown must not hold
+            # the process hostage. Telemetry was flushed by the first signal's task.
+            os._exit(130)
+        stop_started = True
         loop.create_task(service.stop())
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, request_stop)
-        except NotImplementedError, AttributeError:
-            signal.signal(sig, lambda _s, _f: request_stop())
+        except (NotImplementedError, AttributeError):
+            signal.signal(sig, lambda _signum, _frame: request_stop())
 
 
 async def _main() -> int:

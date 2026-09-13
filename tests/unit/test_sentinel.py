@@ -1136,3 +1136,95 @@ class TestUnanticipatedCrashes:
 
         assert not daemon.is_enabled
         assert state.is_trading_allowed, "out of quota disables the Sentinel, never trading"
+
+
+# ─── Poller-death guard: exotic transport bugs must degrade, not crash ────────
+
+
+class _ExplodingPostClient:
+    """Stands in for httpx.AsyncClient with a transport bug httpx does not model."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def post(self, *_a: object, **_k: object) -> None:
+        self.calls += 1
+        raise RuntimeError("object has no attribute 'fileno' — the exotic one")
+
+
+class TestPollerDeathGuard:
+    async def test_exotic_transport_bug_becomes_unavailable(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A non-httpx exception must surface as GeminiError, never kill the poller."""
+        from tachyon.sentinel.api import GeminiClient, GeminiUnavailableError
+
+        fake = _ExplodingPostClient()
+        gemini = GeminiClient(
+            settings=_settings(),
+            journal=JsonlJournal(tmp_path, prefix="sentinel", clock=_clock()),
+            clock=_clock(),
+            client=fake,  # type: ignore[arg-type]
+        )
+        monkeypatch.setattr(gemini._client, "post", fake.post)
+
+        with pytest.raises(GeminiUnavailableError, match="unexpectedly"):
+            await gemini.generate(system="s", prompt="p")
+        assert fake.calls == 1
+
+
+# ─── Degradation → auto-recovery (the permanent-DEGRADED fix) ─────────────────
+
+
+class TestDegradedRecovery:
+    @staticmethod
+    def _fresh() -> MacroState:
+        return MacroState(clock=_clock())
+
+    def test_failure_sets_degraded_and_counts_consecutive(self) -> None:
+        state = self._fresh()
+        state.record_failure("gemini 503")
+        state.record_failure("timeout")
+        snapshot = state.snapshot()
+        assert snapshot.degraded
+        assert snapshot.failures == 2
+        assert snapshot.consecutive_failures == 2
+
+    def test_apply_clears_degraded_and_emits_recovery(self) -> None:
+        """The repo logs through structlog — assert on captured events, not caplog."""
+        import structlog.testing
+
+        state = self._fresh()
+        state.record_failure("network down")
+        with structlog.testing.capture_logs() as logs:
+            state.apply(Regime.RISK_ON, confidence=60, reason="connectivity restored")
+        snapshot = state.snapshot()
+        assert not snapshot.degraded
+        recovered = [entry for entry in logs if entry.get("event") == "sentinel.recovered"]
+        assert recovered, "recovery must be announced, not silent"
+        assert recovered[0]["downtime_seconds"] >= 0
+
+    def test_recovery_never_relaxes_ratchets(self) -> None:
+        """A confident RISK_OFF latches; a later healthy RISK_ON must not un-latch it."""
+        state = self._fresh()
+        state.record_failure("outage")
+        state.apply(Regime.RISK_OFF, confidence=95, reason="VIX blowout")
+        assert not state.is_trading_allowed
+
+        # Connectivity returns; the model now says RISK_ON.
+        for _ in range(3):
+            state.record_failure("stale")
+        state.apply(Regime.RISK_ON, confidence=70, reason="markets calmed")
+        snapshot = state.snapshot()
+        assert not snapshot.degraded, "degraded flag clears on success"
+        assert not snapshot.is_trading_allowed, "session latch survives recovery by design"
+        assert snapshot.size_multiplier < Decimal("1"), "size ratchet never increases"
+
+    def test_reset_session_clears_degradation_bookkeeping(self) -> None:
+        state = self._fresh()
+        state.record_failure("x")
+        state.reset_session()
+        snapshot = state.snapshot()
+        assert not snapshot.degraded
+        assert snapshot.failures == 0
+        assert snapshot.consecutive_failures == 0

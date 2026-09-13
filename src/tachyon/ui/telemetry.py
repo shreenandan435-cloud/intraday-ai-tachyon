@@ -1,32 +1,32 @@
-"""Telemetry bridge — ZeroMQ to WebSocket, CLAUDE.md §2.1, §7.3.
+﻿"""Telemetry bridge â€” ZeroMQ to WebSocket, CLAUDE.md Â§2.1, Â§7.3.
 
 Reads both spines, folds them into one snapshot, and pushes it to browsers at 10 Hz. Three
 independence rules shape the whole module, and each has a specific failure it prevents.
 
 **The publisher must never wait on the UI.** The subscriber connects with ``LINGER = 0`` and a
 bounded high-water mark, so a UI that stalls is dropped by ZeroMQ rather than back-pressuring
-the tick feed (CLAUDE.md §2.1). Nothing here can slow the Brain down.
+the tick feed (CLAUDE.md Â§2.1). Nothing here can slow the Brain down.
 
 **The UI must never wait on a browser.** Each WebSocket client owns a bounded queue. A client
 that cannot keep up loses *its own* frames and nobody else's; the fan-out never awaits a send.
 A laptop that goes to sleep with the dashboard open must not stall the bridge for everyone.
 
 **Conflation is the point, not an optimisation.** The bridge uses
-:meth:`~tachyon.ipc.subscriber.Subscriber.drain_latest` — the userspace conflation built in
-Phase 3 — because the UI renders the newest value and nothing else. Draining a 4000-message
+:meth:`~tachyon.ipc.subscriber.Subscriber.drain_latest` â€” the userspace conflation built in
+Phase 3 â€” because the UI renders the newest value and nothing else. Draining a 4000-message
 backlog to render one frame would be pure waste, and would make the display lag reality by
 exactly as long as the backlog is deep. ``ZMQ_CONFLATE`` is *not* used: it silently discards
 multipart messages entirely (measured against libzmq 4.3.5).
 
 Conflation is permitted here and only here because this consumer is presentation-only. VWAP and
-OBI accumulate over every print, so the strategy path must see them all — but the *rendered*
+OBI accumulate over every print, so the strategy path must see them all â€” but the *rendered*
 numbers are computed by the Brain and arrive already-aggregated.
 
 ``FILL.`` and ``RISK.`` are events, not states
 ----------------------------------------------
 A dropped tick frame costs one repaint. A dropped fill is a trade the operator never sees. So
 the two event topics are drained per *message* into a bounded ring rather than conflated per
-topic, and every one is forwarded. They are low-rate by nature — a handful a day.
+topic, and every one is forwarded. They are low-rate by nature â€” a handful a day.
 """
 
 from __future__ import annotations
@@ -65,7 +65,7 @@ _log = get_logger(__name__)
 
 _ENCODER: Final[msgspec.json.Encoder] = msgspec.json.Encoder()
 
-#: Topics on the tick spine the UI cares about. All conflatable — each carries a full value.
+#: Topics on the tick spine the UI cares about. All conflatable â€” each carries a full value.
 TICK_TOPICS: Final[tuple[str, ...]] = (TOPIC_TICK, TOPIC_DEPTH, "FEED.")
 
 #: Topics on the state spine.
@@ -75,7 +75,7 @@ STATE_TOPICS: Final[tuple[str, ...]] = (TOPIC_STATE, TOPIC_PNL, TOPIC_FILL, TOPI
 #: buffer in a process that runs all day is a leak with extra steps.
 EVENT_RING: Final[int] = 50
 
-#: Frames a slow client may fall behind before it starts losing them. Two seconds at 10 Hz —
+#: Frames a slow client may fall behind before it starts losing them. Two seconds at 10 Hz â€”
 #: long enough to ride out a garbage collection, short enough that a wedged tab is not
 #: rendering a stale frame from a minute ago.
 CLIENT_QUEUE_DEPTH: Final[int] = 20
@@ -204,30 +204,54 @@ class TelemetryBridge:
         self._owns_subscribers = tick_subscriber is None and state_subscriber is None
         # role=UI is what unlocks conflation. STRATEGY or RISK would be refused at
         # construction, which is the guard that keeps a sampled VWAP out of the trading path.
-        self._tick_sub = (
-            tick_subscriber
-            if tick_subscriber is not None
-            else Subscriber(
-                TICK_TOPICS,
-                role=SubscriberRole.UI,
-                endpoint=self._settings.zmq_tick_endpoint,
-                conflate=True,
-                settings=self._settings,
-                clock=clock,
-            )
-        )
-        self._state_sub = (
-            state_subscriber
-            if state_subscriber is not None
-            else Subscriber(
-                STATE_TOPICS,
-                role=SubscriberRole.UI,
-                endpoint=self._settings.zmq_state_endpoint,
-                conflate=True,
-                settings=self._settings,
-                clock=clock,
-            )
-        )
+        # Subscriber construction must never abort the UI boot: the dashboard is a read-only
+        # terminal that must come up even if the Brain hasnt published yet (CLAUDE.md 7.3 -
+        # independence from the trading path). A failure to construct either subscriber is
+        # logged and recorded; poll_once becomes a no-op for that spine.
+        self._tick_sub: Subscriber | None
+        if tick_subscriber is not None:
+            self._tick_sub = tick_subscriber
+        else:
+            try:
+                self._tick_sub = Subscriber(
+                    TICK_TOPICS,
+                    role=SubscriberRole.UI,
+                    endpoint=self._settings.zmq_tick_endpoint,
+                    conflate=True,
+                    settings=self._settings,
+                    clock=clock,
+                )
+            except Exception as exc:
+                self._tick_sub = None
+                _log.warning(
+                    "ui.tick_subscriber_unavailable",
+                    endpoint=self._settings.zmq_tick_endpoint,
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                    impact="tick spine disabled - symbols will not update until restart",
+                )
+        self._state_sub: Subscriber | None
+        if state_subscriber is not None:
+            self._state_sub = state_subscriber
+        else:
+            try:
+                self._state_sub = Subscriber(
+                    STATE_TOPICS,
+                    role=SubscriberRole.UI,
+                    endpoint=self._settings.zmq_state_endpoint,
+                    conflate=True,
+                    settings=self._settings,
+                    clock=clock,
+                )
+            except Exception as exc:
+                self._state_sub = None
+                _log.warning(
+                    "ui.state_subscriber_unavailable",
+                    endpoint=self._settings.zmq_state_endpoint,
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                    impact="state spine disabled - session/pnl/events frozen until restart",
+                )
 
         self._symbols: dict[str, SymbolView] = {}
         self._session: StateUpdate | None = None
@@ -237,7 +261,7 @@ class TelemetryBridge:
         self._stopping = asyncio.Event()
         self.stats = TelemetryStats()
 
-    # ── clients ──────────────────────────────────────────────────────────────
+    # â”€â”€ clients â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     @property
     def client_count(self) -> int:
@@ -270,7 +294,7 @@ class TelemetryBridge:
             clients=len(self._clients),
         )
 
-    # ── snapshot ─────────────────────────────────────────────────────────────
+    # â”€â”€ snapshot â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def snapshot(self) -> dict[str, Any]:
         """The complete current view. Also served by ``GET /api/snapshot``."""
@@ -303,15 +327,15 @@ class TelemetryBridge:
     def snapshot_frame(self) -> bytes:
         return _ENCODER.encode(self.snapshot())
 
-    # ── the loop ─────────────────────────────────────────────────────────────
+    # â”€â”€ the loop â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     async def run(self) -> None:
         """Poll at ``ui.ws_max_hz`` and broadcast. Never raises."""
         _log.info(
             "ui.telemetry_started",
             hz=self._hz,
-            tick_endpoint=self._tick_sub.endpoint,
-            state_endpoint=self._state_sub.endpoint,
+            tick_endpoint=(self._tick_sub.endpoint if self._tick_sub is not None else None),
+            state_endpoint=(self._state_sub.endpoint if self._state_sub is not None else None),
         )
         while not self._stopping.is_set():
             try:
@@ -338,8 +362,10 @@ class TelemetryBridge:
         without ever awaiting on the network.
         """
         self.stats.polls += 1
-        self._apply(self._tick_sub.drain_latest().values(), tick_spine=True)
-        self._apply(self._state_sub.drain_latest().values(), tick_spine=False)
+        if self._tick_sub is not None:
+            self._apply(self._tick_sub.drain_latest().values(), tick_spine=True)
+        if self._state_sub is not None:
+            self._apply(self._state_sub.drain_latest().values(), tick_spine=False)
 
     def _apply(self, envelopes: Iterable[Envelope], *, tick_spine: bool) -> None:
         for envelope in envelopes:
@@ -365,7 +391,7 @@ class TelemetryBridge:
                 self.stats.state_frames += 1
                 self._pnl = message
             elif isinstance(message, (FillUpdate, RiskEvent)):
-                # Events, never conflated away — see the module docstring.
+                # Events, never conflated away â€” see the module docstring.
                 self.stats.events += 1
                 self._events.appendleft({"topic": envelope.topic, **_struct_to_dict(message)})
             elif isinstance(message, Heartbeat) and tick_spine:
@@ -378,7 +404,7 @@ class TelemetryBridge:
             self._symbols[symbol] = view
         return view
 
-    # ── fan-out ──────────────────────────────────────────────────────────────
+    # â”€â”€ fan-out â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def broadcast(self) -> None:
         """Offer the current snapshot to every client. Never awaits, never raises.
@@ -398,10 +424,12 @@ class TelemetryBridge:
         """Stop polling and close the sockets we own."""
         self._stopping.set()
         if self._owns_subscribers:
-            self._tick_sub.close()
-            self._state_sub.close()
+            if self._tick_sub is not None:
+                self._tick_sub.close()
+            if self._state_sub is not None:
+                self._state_sub.close()
 
-    # ── direct injection ─────────────────────────────────────────────────────
+    # â”€â”€ direct injection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def record_event(self, topic: str, **fields: Any) -> None:
         """Push an event raised inside the UI process itself (a panic, a listener fault).
@@ -425,3 +453,5 @@ def _struct_to_dict(message: Any) -> dict[str, Any]:
     if message is None:
         return {}
     return {name: getattr(message, name) for name in getattr(message, "__struct_fields__", ())}
+
+

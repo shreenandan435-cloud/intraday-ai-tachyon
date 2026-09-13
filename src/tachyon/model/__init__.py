@@ -13,4 +13,4 @@ imports this package" is what makes the training stack free to be as heavy as it
 
 from __future__ import annotations
 
-__all__ = ["dataset", "embedding", "transformer"]
+__all__ = ["dataset", "embedding", "transformer", "ppo", "export"]

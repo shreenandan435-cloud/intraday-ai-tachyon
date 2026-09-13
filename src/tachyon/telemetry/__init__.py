@@ -1,11 +1,11 @@
 """Telemetry logging package."""
 
 from tachyon.telemetry.manager import (
-    TelemetryManager,
     CSVTradeLogger,
     ParquetTelemetryLogger,
-    TradeRecord,
     TelemetryConfig,
+    TelemetryManager,
+    TradeRecord,
     create_telemetry_manager,
 )
 

@@ -31,9 +31,18 @@ from tachyon.math_engine.indicators import (
     KERNELS,
     calculate_depth_weighted_obi,
     calculate_ema,
+    calculate_emas,
     calculate_obi,
     calculate_vwap,
     calculate_wilder_atr,
+)
+from tachyon.math_engine.order_flow import (
+    KERNELS as ORDER_FLOW_KERNELS,
+)
+from tachyon.math_engine.order_flow import (
+    calculate_obi_fast,
+    calculate_rvol,
+    sliding_window_volume_sum,
 )
 
 _log = get_logger(__name__)
@@ -82,6 +91,9 @@ def warmup(*, force: bool = False) -> bool:
     try:
         vwap = calculate_vwap(closes, volumes)
         ema = calculate_ema(closes, 21)
+        ema_periods = np.array([9, 21, 50], dtype=np.int64)
+        emas_fused = np.empty(ema_periods.shape[0], dtype=np.float64)
+        calculate_emas(closes, ema_periods, emas_fused)
         atr_default = calculate_wilder_atr(highs, lows, closes)
         atr_explicit = calculate_wilder_atr(highs, lows, closes, 14)
         obi = calculate_obi(100, 100)
@@ -90,13 +102,34 @@ def warmup(*, force: bool = False) -> bool:
         # Also compile the insufficient-data branches, so the NaN paths are not themselves
         # a cold-start cost the first time a symbol is short of history.
         empty = np.zeros(0, dtype=np.float64)
+        emas_empty = np.empty(ema_periods.shape[0], dtype=np.float64)
         calculate_vwap(empty, empty)
         calculate_ema(closes, 10_000)
+        calculate_emas(empty, ema_periods, emas_empty)
         calculate_wilder_atr(highs[:2], lows[:2], closes[:2], 14)
         calculate_obi(0, 0)
         calculate_depth_weighted_obi(empty, empty, empty, empty)
+
+        # Order-flow kernels consumed by the ORB strategy. These run on the live tick
+        # path during the 09:20-09:45 window; a cold compile at 09:20:01 is exactly
+        # the failure the warmup routine exists to prevent.
+        obi_fast = calculate_obi_fast(300.0, 100.0)
+        rvol_fast = calculate_rvol(2_500.0, 1_000.0)
+        sliding_fast = sliding_window_volume_sum(closes, int(closes.shape[0]) - 1, 5)
     except Exception as exc:  # noqa: BLE001 - a failed warmup must be reported, not raised
-        _log.critical("math_engine.warmup_failed", error=str(exc), exc_info=True)
+        hint = (
+            "set NUMBA_CACHE_DIR to a writable directory (the kernel cache locator could "
+            "not be resolved)"
+            if "cache" in str(exc).lower() or "locator" in str(exc).lower()
+            else "inspect the error above"
+        )
+        _log.critical(
+            "math_engine.warmup_failed",
+            error=str(exc),
+            error_type=type(exc).__name__,
+            remedy=hint,
+            exc_info=True,
+        )
         _warm = False
         return False
 
@@ -104,10 +137,25 @@ def warmup(*, force: bool = False) -> bool:
         "vwap": math.isclose(vwap, float(np.mean(closes)), rel_tol=1e-9),
         "ema_finite": math.isfinite(ema),
         "ema_in_range": float(closes.min()) <= ema <= float(closes.max()),
+        # The fused multi-period kernel must agree BIT-FOR-BIT with the per-period kernel:
+        # it is the same recurrence with the dispatch fused, so any divergence means the
+        # fusion changed the arithmetic — and every EMA-derived signal would silently shift.
+        "emas_fused_bit_identical": all(
+            fused == calculate_ema(closes, int(period))
+            for fused, period in zip(emas_fused, ema_periods, strict=True)
+        ),
+        "emas_fused_empty_is_nan": all(math.isnan(value) for value in emas_empty),
         "atr_positive": math.isfinite(atr_default) and atr_default > 0.0,
         "atr_default_matches_explicit": math.isclose(atr_default, atr_explicit, rel_tol=1e-12),
         "obi_balanced_is_zero": obi == 0.0,
         "weighted_obi_balanced_is_zero": math.isclose(weighted, 0.0, abs_tol=1e-12),
+        # ORB kernels: same self-test discipline. Each must produce a known value on
+        # a known input; a wrong number here would propagate straight into a trade.
+        "obi_fast_correct": math.isclose(obi_fast, 0.5, abs_tol=1e-12),
+        "rvol_fast_correct": math.isclose(rvol_fast, 2.5, abs_tol=1e-12),
+        "sliding_window_sum_correct": math.isclose(
+            sliding_fast, float(closes[-5:].sum()), rel_tol=1e-12
+        ),
     }
     failed = [name for name, ok in checks.items() if not ok]
     if failed:
@@ -143,7 +191,7 @@ def _cache_stats() -> tuple[int, int]:
     """
     hits = 0
     misses = 0
-    for kernel in KERNELS:
+    for kernel in (*KERNELS, *ORDER_FLOW_KERNELS):
         hits += sum(getattr(kernel, "_cache_hits", {}).values())
         misses += sum(getattr(kernel, "_cache_misses", {}).values())
     return hits, misses

@@ -246,14 +246,30 @@ class CausalSelfAttention(nn.Module):
         k = k.view(b, 1, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(b, 1, self.n_heads, self.head_dim).transpose(1, 2)
 
-        # Handle KV cache
-        if kv_cache is not None:
-            k = torch.cat([kv_cache.k, k], dim=2)
-            v = torch.cat([kv_cache.v, v], dim=2)
+        # Absolute position of this token = depth of the existing cache, clamped to the
+        # RoPE table. Once the cache saturates at ``max_seq_len`` the unclamped offset
+        # would slice past the table (``cos_table[max:max+1]`` is empty -> broadcast
+        # crash at step max_seq_len+1). While in range the clamp is an identity.
+        max_cache = self.rope.max_seq_len
+        offset = kv_cache.k.size(2) if kv_cache is not None else 0
+        offset = min(offset, max_cache - 1)
 
-        # Apply RoPE to Q and K
-        q = self.rope(q)
-        k = self.rope(k)
+        # RoPE at the true absolute position, applied BEFORE the new K/V enter the cache.
+        # Cached keys were already rotated when they were appended; rotating them again here
+        # would compound the rotation (R_j from step j applied (t-j) times -> R_{(t-j)*j}).
+        q = self.rope(q, offset=offset)
+        k = self.rope(k, offset=offset)
+        # V is NOT rotated
+
+        # Append the already-rotated key to the cache, capped at the RoPE table length.
+        # The slice is an identity while T <= max_cache; beyond it the oldest keys/values
+        # are evicted (sliding window). This strictly bounds VRAM, keeps the per-step
+        # ``cat`` copy cost bounded, and keeps the TensorRT KV profile (T_past <= 1024)
+        # satisfiable when the present caches are fed back. Unconditional slice rather than
+        # a branch: no tensor-value control flow, so the export graph stays single-path.
+        if kv_cache is not None:
+            k = torch.cat([kv_cache.k, k], dim=2)[:, :, -max_cache:, :]
+            v = torch.cat([kv_cache.v, v], dim=2)[:, :, -max_cache:, :]
 
         # Attention (no causal mask needed for single step with cache)
         attn_out = F.scaled_dot_product_attention(
@@ -456,13 +472,16 @@ class CausalTransformer(nn.Module):
             hidden = next_hidden
             new_kv_caches.append(new_cache)
 
-        # Final LayerNorm in FP32
-        x = F.layer_norm(
-            x.float(),
+        # Final LayerNorm in FP32 — applied to the stack OUTPUT (`hidden`), not the input
+        # `x`. Normalising `x` here would discard the entire transformer stack and return
+        # LayerNorm(embedding) to the PPO heads: the KV caches would update but the policy
+        # would be running on the raw input at every live step.
+        hidden = F.layer_norm(
+            hidden.float(),
             self.norm_f.normalized_shape,
             self.norm_f.weight.float(),
             self.norm_f.bias.float(),
             self.norm_f.eps,
-        ).to(x.dtype)
+        ).to(hidden.dtype)
 
-        return x, new_kv_caches
+        return hidden, new_kv_caches

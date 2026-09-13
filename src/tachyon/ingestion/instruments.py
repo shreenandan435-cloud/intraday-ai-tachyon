@@ -213,14 +213,14 @@ def _default_client() -> httpx.AsyncClient:
 def _as_int(value: str | int | float) -> int:
     try:
         return int(float(value))
-    except TypeError, ValueError:
+    except (TypeError, ValueError):
         return 0
 
 
 def _as_float(value: str | int | float) -> float:
     try:
         return float(value)
-    except TypeError, ValueError:
+    except (TypeError, ValueError):
         return 0.0
 
 

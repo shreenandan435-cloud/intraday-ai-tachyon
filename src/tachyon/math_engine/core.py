@@ -25,6 +25,7 @@ VWAP anchoring the day's entries is worse than no VWAP at all.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Final, Self
 
@@ -38,7 +39,7 @@ from tachyon.ipc.schemas import DEPTH_LEVELS, OrderBook, Tick
 from tachyon.math_engine.buffers import FLOAT, CandleBuffer, RingBuffer
 from tachyon.math_engine.indicators import (
     calculate_depth_weighted_obi,
-    calculate_ema,
+    calculate_emas,
     calculate_obi,
     calculate_vwap,
     calculate_wilder_atr,
@@ -51,6 +52,24 @@ DEFAULT_EMA_PERIODS: Final[tuple[int, ...]] = (9, 21, 50)
 DEFAULT_TICK_CAPACITY: Final[int] = 2000
 DEFAULT_CANDLE_CAPACITY: Final[int] = 500
 CANDLE_SECONDS: Final[float] = float(CANDLE_INTERVAL_MINUTES * 60)
+
+
+@dataclass(frozen=True, slots=True)
+class HistoricalBar:
+    """One historical OHLCV candle, in the math engine's internal bar representation.
+
+    Mirrors the row shape produced by
+    :func:`tachyon.ingestion.angel_adapter.parse_historical_rows`: ``start_epoch`` is the
+    candle's bucket start in epoch seconds (already snapped to the 5-minute grid), and the
+    remaining fields are the standard open/high/low/close/volume tuple.
+    """
+
+    start_epoch: float
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,11 +143,14 @@ class TickAggregator:
         "_candle_start",
         "_candle_volume",
         "_candles",
+        "_ema_out",
         "_ema_periods",
+        "_ema_periods_arr",
         "_gaps",
         "_last_cum_volume",
         "_last_seq",
         "_last_ts",
+        "_last_volume_delta",
         "_ltp",
         "_obi",
         "_obi_weighted",
@@ -160,6 +182,12 @@ class TickAggregator:
             recovery_ticks if recovery_ticks is not None else max(ema_periods, default=50)
         )
 
+        # Fused multi-period EMA scratch, allocated once: the int64 period vector the
+        # kernel receives and the float64 output it fills on every snapshot. Reusing both
+        # keeps snapshot() free of per-call allocation (CLAUDE.md §3.2).
+        self._ema_periods_arr: npt.NDArray[np.int64] = np.array(ema_periods, dtype=np.int64)
+        self._ema_out: npt.NDArray[np.float64] = np.empty(len(ema_periods), dtype=np.float64)
+
         self._prices = RingBuffer(tick_capacity, FLOAT)
         self._volumes = RingBuffer(tick_capacity, FLOAT)
         self._candles = CandleBuffer(candle_capacity)
@@ -173,6 +201,7 @@ class TickAggregator:
 
         self._last_seq: int | None = None
         self._last_cum_volume: int | None = None
+        self._last_volume_delta = 0.0
         self._gaps = 0
         self._session_vwap_valid = True
 
@@ -211,6 +240,7 @@ class TickAggregator:
         self._last_seq = tick.seq
 
         volume_delta = self._volume_delta(tick.volume)
+        self._last_volume_delta = volume_delta
 
         self._ltp = tick.ltp
         self._last_ts = tick.ts_epoch
@@ -342,6 +372,16 @@ class TickAggregator:
         return self._session_vwap_valid
 
     @property
+    def last_volume_delta(self) -> float:
+        """This print's size after differencing (``0.0`` until a second tick arrives).
+
+        Exposed so downstream consumers — the risk gate's z-score accumulator — can reuse
+        the exact per-print volume the aggregator computed instead of re-implementing the
+        cumulative-to-delta conversion and possibly disagreeing with it.
+        """
+        return self._last_volume_delta
+
+    @property
     def session_vwap(self) -> float:
         """Exact session VWAP from running accumulators, or ``NaN``.
 
@@ -390,7 +430,10 @@ class TickAggregator:
         prices: Any = self._prices.view()
         volumes: Any = self._volumes.view()
 
-        emas = tuple(float(calculate_ema(prices, period)) for period in self._ema_periods)
+        # One fused pass over the price buffer for every EMA period (single JIT dispatch),
+        # writing into the pre-allocated scratch — not one kernel call per period.
+        calculate_emas(prices, self._ema_periods_arr, self._ema_out)
+        emas = tuple(float(value) for value in self._ema_out)
 
         return IndicatorSnapshot(
             symbol=self.symbol,
@@ -423,6 +466,56 @@ class TickAggregator:
         self._last_ts = 0.0
         self._obi = 0.0
         self._obi_weighted = 0.0
+
+    def seed_bars(self, bars: Sequence[HistoricalBar]) -> None:
+        """Pre-seed the rolling buffers with historical OHLCV bars.
+
+        Called from the 09:05 IST pre-market boot path
+        (:mod:`tachyon.math_engine.warmup`) once
+        :meth:`tachyon.ingestion.angel_adapter.AngelOneWebSocketClient.fetch_historical_candles`
+        has returned three days of 5-minute candles. The point is to remove the one-hour cold
+        start the math engine would otherwise pay for the 14-period Daily ATR, the 20-period
+        EMA, and the rolling volume baseline, by populating the same buffers a live session
+        would produce — so the very first tick at 09:15 lands on a fully warm indicator set.
+
+        The seeding mirrors the live tick path's effects without inventing a fake sequence:
+
+        * Each bar is pushed into the candle ring so ATR, which reads ``_candles.highs`` /
+          ``.lows`` / ``.closes``, has its baseline ready.
+        * Each bar's close is appended to the tick ring, giving the EMA fused kernel
+          (:func:`calculate_emas`) the lookback it needs.
+        * Each bar's volume is appended to the volume ring — the rolling VWAP baseline.
+        * The aggregator's last-seen LTP and timestamp are set to the final bar, so the
+          snapshot's ``ltp`` and ``ts_epoch`` are meaningful even before the first live tick.
+
+        Session VWAP is **not** touched: the pre-seeded data is from prior days and must not
+        contaminate the running session accumulator that opens at 09:15. ``_session_vwap_valid``
+        stays True and ``_pv_sum``/``_v_sum`` stay zero, so the first real tick seeds the
+        session VWAP exactly as it would without pre-seeding.
+
+        Sequence-based gap detection is also untouched: the pre-seeded bars have no sequence
+        number, and the first live tick will seed ``_last_seq`` itself.
+
+        Args:
+            bars: chronological (oldest first) historical candles. Empty input is a no-op —
+                the aggregator stays cold and the live session warms it from the first tick.
+        """
+        if not bars:
+            return
+        for bar in bars:
+            self._candles.push(
+                start_epoch=float(bar.start_epoch),
+                open_=float(bar.open),
+                high=float(bar.high),
+                low=float(bar.low),
+                close=float(bar.close),
+                volume=float(bar.volume),
+            )
+            self._prices.append(float(bar.close))
+            self._volumes.append(float(bar.volume))
+        last = bars[-1]
+        self._ltp = float(last.close)
+        self._last_ts = float(last.start_epoch)
 
     def __repr__(self) -> str:
         return (

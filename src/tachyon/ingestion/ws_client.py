@@ -29,16 +29,33 @@ Angel One expects an application-level ``ping`` text frame; the library's own pr
 ping is disabled because the server is not guaranteed to answer it, and an unanswered
 protocol ping makes ``websockets`` close a perfectly healthy connection.
 
-Because our ping draws a ``pong``, silence is genuinely diagnostic: no frame of any kind
-within :data:`READ_TIMEOUT_SECONDS` means the connection is dead even if TCP has not noticed,
-so we tear it down and reconnect rather than sit on a socket that will never deliver again.
-A quiet market still produces pongs, so this does not misfire at lunchtime.
+Because our ping draws a ``pong``, socket silence is genuinely diagnostic: no frame of any
+kind within :data:`READ_TIMEOUT_SECONDS` means the *connection* is dead even if TCP has not
+noticed, so we tear it down and reconnect rather than sit on a socket that will never deliver
+again. A quiet market still produces pongs, so this does not misfire at lunchtime.
+
+Tick-heartbeat watchdog
+-----------------------
+Socket liveness is **not** feed liveness. A broker-side outage can keep answering ``ping``
+with ``pong`` forever while pushing zero market data — pongs keep resetting the read timeout
+and the engine sits blind with open positions. That is the failure mode behind the live
+incident where the UI showed ``FEED STALE 3330.2 s`` while the process believed everything
+was healthy.
+
+So a second, stricter watchdog runs against **market data frames only**. Text pongs never
+refresh it. If no binary frame arrives within :data:`TICK_STALE_SECONDS` while the market is
+open (09:15–15:30 IST), the connection is torn down and reconnected; outside market hours the
+enforcement suspends, because silence then is correct, not a fault.
+
+Reconnect delays additionally carry multiplicative jitter so a fleet of processes does not
+reconnect in lockstep after a broker restart.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import random
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
 from typing import Final, Self
@@ -47,6 +64,7 @@ import msgspec
 import websockets
 from websockets.asyncio.client import ClientConnection, connect
 
+from tachyon.core.clock import SYSTEM_CLOCK, Clock, is_market_open
 from tachyon.core.config import Settings
 from tachyon.core.logger import get_logger
 from tachyon.ingestion.decoder import SubscriptionMode
@@ -62,6 +80,18 @@ PING_INTERVAL_SECONDS: Final[float] = 25.0
 #: two ping cycles, so an ordinary pong gap cannot trip it.
 READ_TIMEOUT_SECONDS: Final[float] = 60.0
 
+#: No **market data** frame within this window during market hours means the feed is stale
+#: even if pongs keep arriving — the silent-freeze incident. Deliberately far tighter than
+#: the socket-level read timeout, and deliberately scoped to binary frames only.
+TICK_STALE_SECONDS: Final[float] = 5.0
+
+#: How often the tick watchdog re-checks staleness.
+WATCHDOG_INTERVAL_SECONDS: Final[float] = 1.0
+
+#: Multiplicative reconnect jitter (±fraction). Jitter prevents a fleet of processes from
+#: reconnecting in lockstep after a broker-side restart.
+DEFAULT_JITTER_FRACTION: Final[float] = 0.25
+
 #: How long a connection must survive before its success "counts" and the backoff resets.
 STABLE_CONNECTION_SECONDS: Final[float] = 30.0
 
@@ -76,6 +106,15 @@ BinaryHandler = Callable[[bytes], None]
 
 class FeedAuthenticationError(RuntimeError):
     """The broker rejected our credentials. Retrying will not help."""
+
+
+class StaleFeedError(ConnectionError):
+    """No market data within ``tick_stale_seconds`` during market hours.
+
+    Subclasses :class:`ConnectionError` so the reconnect loop treats it like any
+    other transport failure: tear down, back off, resubscribe — session state
+    lives outside this client and is never touched by the retry.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,6 +201,7 @@ class FeedStats:
     text_frames: int = 0
     handler_errors: int = 0
     read_timeouts: int = 0
+    stale_reconnects: int = 0
     last_error: str | None = None
 
 
@@ -173,15 +213,33 @@ class SmartApiFeedClient:
         subscriptions: tokens grouped by exchange type.
         on_binary: called with every binary frame. Must not block the event loop.
         mode: subscription mode. Snap Quote (3) is required for L2 depth.
+        url: SmartStream endpoint. Empty or ``None`` falls back to
+            :data:`SMART_STREAM_URL` — an empty string must never reach ``getaddrinfo``.
+            A non-empty URL must use the ``ws://`` or ``wss://`` scheme; anything else is
+            a configuration error and is rejected at construction, not mid-handshake.
         backoff_seconds: reconnect delay schedule; the last value repeats.
         max_attempts: consecutive failures before giving up. ``None`` retries forever.
+        jitter_fraction: multiplicative reconnect jitter (±fraction of the delay).
+        max_backoff_seconds: optional hard cap on the jittered delay. ``None`` leaves the
+            configured schedule unclamped.
+        tick_stale_seconds: no binary frame for this long during market hours trips the
+            watchdog and forces a reconnect (the silent-freeze guard).
+        enforce_market_hours: when True (default) the tick watchdog only enforces while
+            :func:`~tachyon.core.clock.is_market_open` is true; overnight silence is correct,
+            not a fault.
+        clock: injectable clock; tests pass a fake to freeze market hours.
     """
 
     __slots__ = (
         "_backoff",
+        "_clock",
         "_connection",
         "_credentials",
+        "_enforce_market_hours",
+        "_jitter_fraction",
+        "_last_binary_monotonic",
         "_max_attempts",
+        "_max_backoff_seconds",
         "_mode",
         "_on_binary",
         "_ping_interval",
@@ -189,7 +247,9 @@ class SmartApiFeedClient:
         "_stopping",
         "_subscribed",
         "_subscriptions",
+        "_tick_stale_seconds",
         "_url",
+        "_watchdog_interval",
         "stats",
     )
 
@@ -200,30 +260,57 @@ class SmartApiFeedClient:
         *,
         on_binary: BinaryHandler,
         mode: SubscriptionMode = SubscriptionMode.SNAP_QUOTE,
-        url: str = SMART_STREAM_URL,
+        url: str | None = SMART_STREAM_URL,
         backoff_seconds: Sequence[float] = (1.0, 2.0, 5.0, 10.0, 30.0),
         max_attempts: int | None = 20,
         ping_interval: float = PING_INTERVAL_SECONDS,
         read_timeout: float = READ_TIMEOUT_SECONDS,
+        tick_stale_seconds: float = TICK_STALE_SECONDS,
+        watchdog_interval: float = WATCHDOG_INTERVAL_SECONDS,
+        jitter_fraction: float = DEFAULT_JITTER_FRACTION,
+        max_backoff_seconds: float | None = None,
+        enforce_market_hours: bool = True,
+        clock: Clock = SYSTEM_CLOCK,
     ) -> None:
         if not subscriptions:
             raise ValueError("at least one TokenSubscription is required")
         if not backoff_seconds:
             raise ValueError("backoff_seconds must not be empty")
+        if not 0.0 <= jitter_fraction <= 1.0:
+            raise ValueError(f"jitter_fraction must be within [0, 1], got {jitter_fraction}")
+        if tick_stale_seconds <= 0:
+            raise ValueError(f"tick_stale_seconds must be positive, got {tick_stale_seconds}")
+
+        # URL guard: empty/None falls back to the canonical SmartStream v2 endpoint, and a
+        # non-empty URL must already carry a websocket scheme. Validating here — not in
+        # _session — means a misconfigured URL fails fast at construction instead of ever
+        # reaching getaddrinfo as an empty host.
+        resolved_url = (url or "").strip() or SMART_STREAM_URL
+        if not resolved_url.startswith(("ws://", "wss://")):
+            raise ValueError(
+                f"SmartApiFeedClient URL must use the ws:// or wss:// scheme, got {resolved_url!r}"
+            )
 
         self._credentials = credentials
         self._subscriptions = tuple(subscriptions)
         self._on_binary = on_binary
         self._mode = mode
-        self._url = url
+        self._url = resolved_url
         self._backoff = tuple(backoff_seconds)
         self._max_attempts = max_attempts
         self._ping_interval = ping_interval
         self._read_timeout = read_timeout
+        self._tick_stale_seconds = tick_stale_seconds
+        self._watchdog_interval = watchdog_interval
+        self._jitter_fraction = jitter_fraction
+        self._max_backoff_seconds = max_backoff_seconds
+        self._enforce_market_hours = enforce_market_hours
+        self._clock = clock
 
         self._stopping = asyncio.Event()
         self._connection: ClientConnection | None = None
         self._subscribed = False
+        self._last_binary_monotonic: float | None = None
         self.stats = FeedStats()
 
     # ── lifecycle ────────────────────────────────────────────────────────────
@@ -241,6 +328,25 @@ class SmartApiFeedClient:
         trading against a frozen view of the book.
         """
         return self._subscribed
+
+    @property
+    def seconds_since_last_tick(self) -> float | None:
+        """Seconds since the last binary (market data) frame, or ``None`` pre-connect.
+
+        Text pongs deliberately do not refresh this — they prove the *socket*, not the
+        *feed*. This is the number the silent-freeze incident was missing.
+        """
+        if self._last_binary_monotonic is None:
+            return None
+        loop = asyncio.get_running_loop()
+        return max(0.0, loop.time() - self._last_binary_monotonic)
+
+    def _apply_jitter(self, delay: float) -> float:
+        """Spread a reconnect delay by ±``jitter_fraction`` and honour the cap."""
+        jittered = delay * (1.0 + random.uniform(-self._jitter_fraction, self._jitter_fraction))
+        if self._max_backoff_seconds is not None:
+            jittered = min(jittered, self._max_backoff_seconds)
+        return max(0.0, jittered)
 
     def subscription_payload(self, action: int = ACTION_SUBSCRIBE) -> str:
         """Build the subscribe/unsubscribe request.
@@ -326,12 +432,12 @@ class SmartApiFeedClient:
                     f"last error: {self.stats.last_error}"
                 )
 
-            delay = self.backoff_for(attempt)
+            delay = self._apply_jitter(self.backoff_for(attempt))
             self.stats.reconnects += 1
             _log.warning(
                 "feed.reconnecting",
                 attempt=attempt,
-                delay_seconds=delay,
+                delay_seconds=round(delay, 3),
                 uptime_seconds=round(uptime, 1),
                 error=self.stats.last_error,
             )
@@ -345,6 +451,19 @@ class SmartApiFeedClient:
 
     async def _session(self) -> None:
         """Hold a single connection open until it fails or we are asked to stop."""
+        # Sequencing gate: no DNS resolution and no handshake until the authentication
+        # tokens are confirmed and the URL is fully populated. Dialling on empty
+        # credentials fails deep in the transport and masquerades as a network fault
+        # ([Errno 11001] getaddrinfo failed) instead of the auth fault it really is.
+        if not self._credentials.is_complete():
+            raise FeedAuthenticationError(
+                "refusing to open the websocket: feed credentials incomplete — authenticate "
+                "before starting the feed"
+            )
+        if not self._url.startswith(("ws://", "wss://")):
+            raise ValueError(f"refusing to open the websocket: URL not populated: {self._url!r}")
+
+        loop = asyncio.get_running_loop()
         async with connect(
             self._url,
             additional_headers=self._credentials.headers(),
@@ -356,6 +475,9 @@ class SmartApiFeedClient:
         ) as connection:
             self._connection = connection
             self.stats.connects += 1
+            # Grace period: the clock starts at connect, so a slow first tick after an
+            # open is not instantly judged stale.
+            self._last_binary_monotonic = loop.time()
             _log.info(
                 "feed.connected",
                 url=self._url,
@@ -370,13 +492,16 @@ class SmartApiFeedClient:
             _log.info("feed.subscribed", mode=int(self._mode))
 
             keepalive = asyncio.create_task(self._keepalive(connection))
+            watchdog = asyncio.create_task(self._tick_watchdog(connection))
             try:
                 await self._consume(connection)
             finally:
                 self._subscribed = False
+                watchdog.cancel()
                 keepalive.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await keepalive
+                for task in (keepalive, watchdog):
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
 
     async def _consume(self, connection: ClientConnection) -> None:
         """Read frames until the connection dies or goes silent."""
@@ -393,11 +518,49 @@ class SmartApiFeedClient:
                 raise
 
             if isinstance(message, bytes):
+                # Only market data refreshes the tick watchdog. Pongs prove the socket,
+                # not the feed — refreshing on them is what let the feed freeze silently
+                # for 3330 s while the process reported healthy.
+                self._last_binary_monotonic = asyncio.get_running_loop().time()
                 self.stats.binary_frames += 1
                 self._dispatch(message)
             else:
                 self.stats.text_frames += 1
                 self._handle_text(message)
+
+    async def _tick_watchdog(self, connection: ClientConnection) -> None:
+        """Force a reconnect when market data goes quiet during market hours.
+
+        Runs alongside :meth:`_consume`. On breach it closes the connection, which makes
+        the pending ``recv`` raise and unwinds :meth:`_session` into the reconnect path —
+        the same treatment as a read timeout. Outside market hours it stands down: no
+        ticks at 21:00 IST is correct, not a fault.
+        """
+        while not self._stopping.is_set():
+            await asyncio.sleep(self._watchdog_interval)
+            if self._stopping.is_set() or not self._subscribed:
+                continue
+            if self._enforce_market_hours and not is_market_open(clock=self._clock):
+                continue
+
+            last = self._last_binary_monotonic
+            if last is None:
+                continue
+            age = asyncio.get_running_loop().time() - last
+            if age <= self._tick_stale_seconds:
+                continue
+
+            self.stats.stale_reconnects += 1
+            _log.critical(
+                "feed.stale_data",
+                seconds_since_last_tick=round(age, 2),
+                threshold_seconds=self._tick_stale_seconds,
+                action="closing connection and reconnecting; subscriptions are re-sent "
+                "automatically and downstream session state is untouched",
+            )
+            with contextlib.suppress(Exception):
+                await connection.close(code=4900, reason="tachyon tick-stale watchdog")
+            return
 
     def _dispatch(self, payload: bytes) -> None:
         """Hand a frame to the consumer, absorbing handler failures.
